@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - name: Check build options
-        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta') && github.event.inputs.git-ref != 'master' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta') }}
         run: |
           echo "::error title=CheckFail::Nightly and Beta Release MUST be built from master"
           exit 1
@@ -222,171 +222,7 @@ jobs:
           DEBUG: "pw:api"
           RELEASE: true # skip dev only test
 
-  build-linux-x64:
-    runs-on: ubuntu-20.04
-    needs: [ compile-cljs ]
-    steps:
-      - name: Download The Static Asset
-        uses: actions/download-artifact@v3
-        with:
-          name: static
-          path: static
-
-      - name: Retrieve tag version
-        id: ref
-        run: |
-          pkgver=$(cat ./static/VERSION)
-          echo "version=$pkgver" >> $GITHUB_OUTPUT
-
-      - name: Install Node.js, NPM and Yarn
-        uses: actions/setup-node@v3
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      # - name: Cache Node Modules
-      #   uses: actions/cache@v3
-      #   with:
-      #     path: |
-      #       **/node_modules
-      #     key: ${{ runner.os }}-node-modules
-
-      - name: Build/Release Electron App
-        run: yarn install && yarn electron:make
-        working-directory: ./static
-
-      - name: Save artifacts
-        run: |
-          mkdir -p builds
-          # NOTE: save VERSION file to builds directory
-          cp static/VERSION ./builds/VERSION
-          mv static/out/make/*-*.AppImage ./builds/Logseq-linux-x64-${{ steps.ref.outputs.version }}.AppImage
-          mv static/out/make/zip/linux/x64/*-linux-x64-*.zip ./builds/Logseq-linux-x64-${{ steps.ref.outputs.version }}.zip
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: logseq-linux-x64-builds
-          path: builds
-
-  build-linux-arm64:
-    runs-on: ubuntu-20.04
-    needs: [ compile-cljs ]
-    steps:
-      - name: Download The Static Asset
-        uses: actions/download-artifact@v3
-        with:
-          name: static
-          path: static
-
-      - name: Retrieve tag version
-        id: ref
-        run: |
-          pkgver=$(cat ./static/VERSION)
-          echo "version=$pkgver" >> $GITHUB_OUTPUT
-
-      - name: Install Node.js, NPM and Yarn
-        uses: actions/setup-node@v3
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Fetch deps
-        env:
-          npm_config_arch: arm64
-        run: |
-          yarn install --target_arch=arm64 --target_platform=linux
-          rsapi_version=`node -e 'console.log(require("@logseq/rsapi/package.json").optionalDependencies["@logseq/rsapi-linux-arm64-gnu"])'`
-          temp_dir=`mktemp -d`
-          cd "$temp_dir"
-          echo '{"dependencies": {"@logseq/rsapi-linux-arm64-gnu": "'"$rsapi_version"'"}}' > package.json
-          yarn install --ignore-platform
-          cd -
-          mv "$temp_dir/node_modules/@logseq/rsapi-linux-arm64-gnu" node_modules/@logseq/rsapi-linux-arm64-gnu
-          rm -rf "$temp_dir" "node_modules/@logseq/rsapi-linux-x64-gnu"
-        working-directory: ./static
-
-      - name: Build/Release Electron App
-        run: yarn electron:make-linux-arm64
-        working-directory: ./static
-
-      - name: Save artifacts
-        run: |
-          mkdir -p builds
-          # NOTE: save VERSION file to builds directory
-          cp static/VERSION ./builds/VERSION
-          # mv static/out/make/*-*.AppImage ./builds/Logseq-linux-arm64-${{ steps.ref.outputs.version }}.AppImage
-          mv static/out/make/zip/linux/arm64/*-linux-arm64-*.zip ./builds/Logseq-linux-arm64-${{ steps.ref.outputs.version }}.zip
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: logseq-linux-arm64-builds
-          path: builds
-
-  build-windows:
-    runs-on: windows-latest
-    needs: [ compile-cljs ]
-    steps:
-      - name: Download The Static Asset
-        uses: actions/download-artifact@v3
-        with:
-          name: static
-          path: static
-
-      - name: Retrieve tag version
-        id: ref
-        run: echo "version=$(cat ./static/VERSION)" >> $env:GITHUB_OUTPUT
-
-      - name: Install Node.js, NPM and Yarn
-        uses: actions/setup-node@v3
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      # - name: Cache Node Modules
-      #   uses: actions/cache@v3
-      #   with:
-      #    path: |
-      #      **/node_modules
-      #    key: ${{ runner.os }}-node-modules
-
-      - name: Deps Electron app
-        run: yarn install
-        working-directory: ./static
-
-      - name: Fix Deps Electron app
-        run: yarn run postinstall
-        working-directory: ./static/node_modules/dugite/
-
-      - name: Build/Release Electron app
-        run: yarn electron:make
-        working-directory: ./static
-        #env:
-        #  CODE_SIGN_CERTIFICATE_FILE: ../codesign.pfx
-        #  CODE_SIGN_CERTIFICATE_PASSWORD: ${{ secrets.CODE_SIGN_CERTIFICATE_PASSWORD }}
-
-      - name: Save Artifact for Code Signing
-        run: |
-          mkdir builds
-          mv static\out\make\squirrel.windows\x64\*.exe    builds\Logseq-win-x64-${{ steps.ref.outputs.version }}.exe
-
-      - name: Upload Artifact for Code Signing
-        uses: actions/upload-artifact@v3
-        with:
-          name: logseq-win64-unsigned-builds
-          path: builds
-
-      - name: Save Artifact
-        run: |
-          rm builds\*.exe
-          mv static\out\make\squirrel.windows\x64\*.nupkg  builds\Logseq-win-x64-${{ steps.ref.outputs.version }}-full.nupkg
-          mv static\out\make\zip\win32\x64\*.zip           builds\Logseq-win-x64-${{ steps.ref.outputs.version }}.zip
-          mv static\out\make\wix\x64\Logseq.msi            builds\Logseq-win-x64-${{ steps.ref.outputs.version }}.msi
-          mv static\out\make\squirrel.windows\x64\RELEASES builds\RELEASES
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: logseq-win64-builds
-          path: builds
+  
 
   build-macos-x64:
     needs: [ compile-cljs ]
@@ -541,18 +377,6 @@ jobs:
           name: logseq-darwin-arm64-builds
           path: builds
 
-  # reuse workflow via workflow_call
-  build-android:
-    uses: ./.github/workflows/build-android.yml
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.build-android == 'true' }}
-    with:
-      build-target: "${{ github.event.inputs.build-target }}"
-      # if scheduled, use production mode
-      enable-file-sync-production: "${{ github.event_name == 'schedule' || github.event.inputs.enable-file-sync-production == 'true' }}"
-    secrets:
-      ANDROID_KEYSTORE: "${{ secrets.ANDROID_KEYSTORE }}"
-      ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
-      SENTRY_AUTH_TOKEN: "${{ secrets.SENTRY_AUTH_TOKEN }}"
 
   codesign-windows:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta' }}
