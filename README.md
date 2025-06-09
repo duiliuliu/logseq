@@ -54,6 +54,7 @@
 
 ## Table of Contents
 
+  * [<g-emoji class="g-emoji" alias="database" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f680.png">🚀</g-emoji> Database Version](#-database-version)
   * [<g-emoji class="g-emoji" alias="thinking" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f914.png">🤔</g-emoji> Why Logseq?](#-why-logseq)
   * [<g-emoji class="g-emoji" alias="eyes" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f440.png">👀</g-emoji> How can I use it?](#-how-can-i-use-it)
   * [<g-emoji class="g-emoji" alias="books" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f4da.png">📚</g-emoji> Learn more](#-learn-more)
@@ -64,6 +65,14 @@
     * [<g-emoji class="g-emoji" alias="hammer_and_wrench" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f6e0.png">🛠️</g-emoji> Setting Up a Development Environment](#️-setting-up-a-development-environment)
   * [<g-emoji class="g-emoji" alias="sparkles" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/2728.png">✨</g-emoji> Inspiration](#-inspiration)
 * [<g-emoji class="g-emoji" alias="pray" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f64f.png">🙏</g-emoji> Thank You](#-thank-you)
+
+## 🚀 Database Version
+
+The Database version (DB version) of Logseq introduces DB graphs while maintaining support for file graphs. [See this page](https://github.com/logseq/docs/blob/master/db-version.md) to get an overview of the main features for DB graphs. If you are an existing user, [see this page](https://github.com/logseq/docs/blob/master/db-version-changes.md) to get an overview of changes with the DB version.
+
+The DB version of Logseq is alpha software. When using DB graphs, we recommend you create a dedicated test graph and choose one project/workflow that’s not crucial for you. **Data loss is possible**, which is why we recommend [automated backups](https://github.com/logseq/docs/blob/master/db-version.md#automated-backup) or making [regular SQLite DB backups](https://github.com/logseq/docs/blob/master/db-version.md#graph-export). When using file graphs, **data corruption is possible** as some file content can be duplicated. We only recommend using file graphs if you are making regular backups with git.
+
+To try the latest web version, go to https://test.logseq.com/. For DB version issues, please report them to https://github.com/logseq/db-test/issues. To try the latest desktop version, go to https://github.com/logseq/logseq/actions/workflows/build-desktop-release.yml and click on the latest release. Scroll to the bottom and under the `Artifacts` section download the artifact for your operating system.
 
 ## 🤔 Why Logseq?
 
@@ -152,7 +161,7 @@ Logseq is also made possible by the following projects:
 * [Clojure & ClojureScript](https://clojure.org/) - A dynamic, functional, general-purpose programming language
 * [DataScript](https://github.com/tonsky/datascript) - An immutable database and Datalog query-engine for Clojure,
 ClojureScript and JS
-* [OCaml](https://ocaml.org/) & [Angstrom](https://github.com/inhabitedtype/angstrom), for the document parser [maldoc](https://github.com/mldoc/mldoc)
+* [OCaml](https://ocaml.org/) & [Angstrom](https://github.com/inhabitedtype/angstrom), for the document parser [mldoc](https://github.com/logseq/mldoc)
 * [isomorphic-git](https://isomorphic-git.org/) - A pure JavaScript implementation of Git for NodeJS and web browsers
 * [SCI](https://github.com/borkdude/sci) - A Small Clojure Interpreter
 
@@ -165,13 +174,6 @@ We want to express our sincere gratitude to our [Open Collective](https://openco
 <p align="center">
     <a href="https://opencollective.com/logseq#sponsor"> [Become a sponsor]</a>
 </p>
-<!-- Deta Logo -->
-<p align="center">
-    <a href="https://www.deta.sh/" alt="Deta">
-        <img src="https://uploads-ssl.webflow.com/5eb96efa78dc680fc15be3be/5ebd24f6cbf6e9ebd674656e_Logo.svg"
-        style="width: 200px; height: 100px;"/></a>
-</p>
-
 <p align="center">
     <a href="https://opencollective.com/logseq" alt="Sponsors on Open Collective">
         <img src="https://opencollective.com/logseq/tiers/sponsors.svg?avatarHeight=42&width=600"/></a>

@@ -1,15 +1,11 @@
 (ns transact
   "This script generically runs transactions against the queried blocks"
-  (:require [logseq.outliner.cli.persist-graph :as persist-graph]
-            [logseq.db.sqlite.cli :as sqlite-cli]
-            [logseq.db.sqlite.db :as sqlite-db]
-            [logseq.db.frontend.rules :as rules]
+  (:require [clojure.edn :as edn]
             [datascript.core :as d]
-            [clojure.edn :as edn]
-            [clojure.string :as string]
-            [nbb.core :as nbb]
-            ["path" :as node-path]
-            ["os" :as os]))
+            [logseq.db.frontend.rules :as rules]
+            [logseq.db.common.sqlite-cli :as sqlite-cli]
+            [logseq.outliner.db-pipeline :as db-pipeline]
+            [nbb.core :as nbb]))
 
 (defn -main [args]
   (when (< (count args) 3)
@@ -17,11 +13,9 @@
     (js/process.exit 1))
   (let [[graph-dir query* transact-fn*] args
         dry-run? (contains? (set args) "-n")
-        [dir db-name] (if (string/includes? graph-dir "/")
-                        ((juxt node-path/dirname node-path/basename) graph-dir)
-                        [(node-path/join (os/homedir) "logseq" "graphs") graph-dir])
-        _ (sqlite-db/open-db! dir db-name)
-        conn (sqlite-cli/read-graph db-name)
+        open-db-args (sqlite-cli/->open-db-args graph-dir)
+        db-name (if (= 1 (count open-db-args)) (first open-db-args) (second open-db-args))
+        conn (apply sqlite-cli/open-db! open-db-args)
         ;; find blocks to update
         query (into (edn/read-string query*) [:in '$ '%]) ;; assumes no :in are in queries
         transact-fn (edn/read-string transact-fn*)
@@ -33,11 +27,11 @@
       (do (println "Would update" (count blocks-to-update) "blocks with the following tx:")
           (prn update-tx)
           (println "With the following blocks updated:")
-          (prn (map #(select-keys (d/entity @conn %) [:block/name :block/content]) blocks-to-update)))
+          (prn (map #(select-keys (d/entity @conn %) [:block/name :block/title]) blocks-to-update)))
       (do
-        (persist-graph/add-listener conn db-name)
+        (db-pipeline/add-listener conn)
         (d/transact! conn update-tx)
         (println "Updated" (count update-tx) "block(s) for graph" (str db-name "!"))))))
 
-(when (= nbb/*file* (:file (meta #'-main)))
+(when (= nbb/*file* (nbb/invoked-file))
   (-main *command-line-args*))

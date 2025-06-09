@@ -23,7 +23,7 @@ env:
   CLOJURE_VERSION: '1.11.1.1413'
   JAVA_VERSION: '11'
   # This is the latest node version we can run.
-  NODE_VERSION: '18'
+  NODE_VERSION: '20'
   BABASHKA_VERSION: '1.0.168'
 
 jobs:
@@ -83,16 +83,16 @@ jobs:
           bb: ${{ env.BABASHKA_VERSION }}
 
       - name: Run clj-kondo lint
-        run: clojure -M:clj-kondo --parallel --lint src
+        run: clojure -M:clj-kondo --lint src test
 
       - name: Carve lint for unused vars
-        run: bb lint:carve 2>/dev/null
+        run: bb lint:carve
 
       - name: Lint for vars that are too large
-        run: bb lint:large-vars 2>/dev/null
+        run: bb lint:large-vars
 
       - name: Lint datalog rules
         run: bb lint:rules
 
       - name: Lint for namespaces that aren't documented
-        run: bb lint:ns-docstrings 2>/dev/null
+        run: bb lint:ns-docstrings

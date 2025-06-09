@@ -1,37 +1,46 @@
 (ns frontend.components.journal
-  (:require [clojure.string :as string]
-            [frontend.components.page :as page]
-            [frontend.db :as db]
+  (:require [frontend.components.page :as page]
+            [frontend.components.views :as views]
             [frontend.db-mixins :as db-mixins]
-            [frontend.handler.page :as page-handler]
+            [frontend.db.react :as react]
             [frontend.state :as state]
             [frontend.ui :as ui]
+            [frontend.util :as util]
+            [goog.dom :as gdom]
+            [promesa.core :as p]
             [rum.core :as rum]))
 
-(rum/defc journal-cp < rum/reactive
-  [title]
-  (let [;; Don't edit the journal title
-        page (string/lower-case title)
-        repo (state/sub :git/current-repo)]
-    (page/page {:repo repo
-                :page-name page})))
+(rum/defc journal-cp < rum/static
+  [id last?]
+  [:div.journal-item.content
+   (when last?
+     {:class "journal-last-item"})
+   (page/page-cp {:db/id id})])
 
-(rum/defc journals < rum/reactive
-  [latest-journals]
-  [:div#journals
-   (ui/infinite-list
-    "main-content-container"
-    (for [{:block/keys [name]} latest-journals]
-      [:div.journal-item.content {:key name}
-       (journal-cp name)])
-    {:has-more (page-handler/has-more-journals?)
-     :more-class "text-4xl"
-     :on-top-reached page-handler/create-today-journal!
-     :on-load (fn []
-                (page-handler/load-more-journals!))})])
+(defn- sub-journals
+  []
+  (when-let [repo (state/get-current-repo)]
+    (some-> (react/q repo
+                     [:frontend.worker.react/journals]
+                     {:query-fn (fn [_]
+                                  (p/let [{:keys [data]} (views/<load-view-data nil {:journals? true})]
+                                    (remove nil? data)))}
+                     nil)
+            util/react)))
 
 (rum/defc all-journals < rum/reactive db-mixins/query
   []
-  (let [journals-length (state/sub :journals-length)
-        latest-journals (db/get-latest-journals (state/get-current-repo) journals-length)]
-    (journals latest-journals)))
+  (let [data (sub-journals)]
+    (when (seq data)
+      [:div#journals
+       (ui/virtualized-list
+        {:custom-scroll-parent (gdom/getElement "main-content-container")
+         :increase-viewport-by {:top 300 :bottom 300}
+         :compute-item-key (fn [idx]
+                             (let [id (util/nth-safe data idx)]
+                               (str "journal-" id)))
+         :total-count (count data)
+         :item-content (fn [idx]
+                         (let [id (util/nth-safe data idx)
+                               last? (= (inc idx) (count data))]
+                           (journal-cp id last?)))})])))

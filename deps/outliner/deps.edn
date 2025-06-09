@@ -1,10 +1,14 @@
 {:deps
- ;; External deps should be kept in sync with https://github.com/logseq/nbb-logseq/blob/main/bb.edn
+ ;; These nbb-logseq deps are kept in sync with https://github.com/logseq/nbb-logseq/blob/main/bb.edn
  {datascript/datascript {:git/url "https://github.com/logseq/datascript" ;; fork
-                         :sha     "3b578bb4b39efda730cdae5f8e679060101b5110"}
+                         :sha     "b28f6574b9447bba9ccaa5d2b0cfd79308acf0e3"}
+  com.cognitect/transit-cljs {:mvn/version "0.8.280"}
+
+  ;; Any other deps should be added here and to nbb.edn
   logseq/db             {:local/root "../db"}
-  com.cognitect/transit-cljs {:mvn/version "0.8.280"}}
+  logseq/graph-parser   {:local/root "../db"}
+  metosin/malli {:mvn/version "0.16.1"}}
  :aliases
  {:clj-kondo
-  {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2023.05.26"}}
+  {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.09.27"}}
    :main-opts  ["-m" "clj-kondo.main"]}}}

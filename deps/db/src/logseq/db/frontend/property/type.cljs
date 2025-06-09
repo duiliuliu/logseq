@@ -1,8 +1,11 @@
 (ns logseq.db.frontend.property.type
   "Provides property types and related helper fns e.g. property value validation
   fns and their allowed schema attributes"
-  (:require [datascript.core :as d]
-            [clojure.set :as set]))
+  (:require [clojure.set :as set]
+            [clojure.string :as string]
+            [datascript.core :as d]
+            [logseq.common.util.macro :as macro-util]
+            [logseq.db.frontend.entity-util :as entity-util]))
 
 ;; Config vars
 ;; ===========
@@ -11,32 +14,61 @@
 
 (def internal-built-in-property-types
   "Valid property types only for use by internal built-in-properties"
-  #{:keyword :map :coll :any})
+  #{:keyword :map :coll :any :entity :class :page :property :string :raw-number})
 
 (def user-built-in-property-types
   "Valid property types for users in order they appear in the UI"
-  [:default :number :date :checkbox :url :page :template])
+  [:default :number :date :datetime :checkbox :url :node])
 
 (def closed-value-property-types
-  "Valid schema :type for closed values"
-  #{:default :number :date :url :page})
+  "Valid property :type for closed values"
+  #{:default :number :url})
+
+(def cardinality-property-types
+  "Valid property types that can change cardinality"
+  #{:default :number :url :date :node})
+
+(def default-value-ref-property-types
+  "Valid ref property :type for default value support"
+  #{:default :number :checkbox})
+
+(def text-ref-property-types
+  "Valid ref property :types that support text"
+  #{:default :url :entity})
+
+(assert (set/subset? cardinality-property-types (set user-built-in-property-types))
+        "All closed value types are valid property types")
 
 (assert (set/subset? closed-value-property-types (set user-built-in-property-types))
         "All closed value types are valid property types")
 
-(def ^:private user-built-in-allowed-schema-attributes
-  "Map of types to their set of allowed :schema attributes"
-  (merge-with into
-              (zipmap closed-value-property-types (repeat #{:values :position}))
-              {:number #{:cardinality}
-               :date #{:cardinality}
-               :url #{:cardinality}
-               :page #{:cardinality :classes}
-               :template #{:classes}
-               :checkbox #{}}))
+(def original-value-ref-property-types
+  "Property value ref types where the refed entity stores its value in
+  :logseq.property/value e.g. :number is stored as a number. new value-ref-property-types
+  should default to this as it allows for more querying power"
+  #{:number})
 
-(assert (= (set user-built-in-property-types) (set (keys user-built-in-allowed-schema-attributes)))
-        "Each user built in type should have an allowed schema attribute")
+(def value-ref-property-types
+  "Property value ref types where the refed entities either store their value in
+  :logseq.property/value or :block/title (for :default)"
+  (into #{:default :url} original-value-ref-property-types))
+
+(def user-ref-property-types
+  "User ref types. Property values that users see are stored in either
+  :logseq.property/value or :block/title. :block/title is for all the page related types"
+  (into #{:date :node} value-ref-property-types))
+
+(assert (set/subset? user-ref-property-types
+                     (set user-built-in-property-types))
+        "All ref types are valid property types")
+
+(def all-ref-property-types
+  "All ref types - user and internal"
+  (into #{:entity :class :page :property} user-ref-property-types))
+
+(assert (set/subset? all-ref-property-types
+                     (set/union (set user-built-in-property-types) internal-built-in-property-types))
+        "All ref types are valid property types")
 
 ;; Property value validation
 ;; =========================
@@ -45,7 +77,7 @@
 
 (defn url?
   "Test if it is a `protocol://`-style URL.
-   Originally from gp-util/url? but does not need to be the same"
+   Originally from common-util/url? but does not need to be the same"
   [s]
   (and (string? s)
        (try
@@ -53,67 +85,100 @@
          (catch :default _e
            false))))
 
-(defn- logseq-page?
+(defn macro-url?
+  [s]
+  ;; TODO: Confirm that macro expanded value is url when it's easier to pass data into validations
+  (macro-util/macro? s))
+
+(defn- url-entity?
+  "Empty string, url or macro url"
+  [db val {:keys [new-closed-value?]}]
+  (if new-closed-value?
+    (or (url? val) (macro-url? val))
+    (when-let [ent (d/entity db val)]
+      (let [title (:block/title ent)]
+        (or (string/blank? title) (url? title) (macro-url? title))))))
+
+(defn- entity?
   [db id]
-  (and (uuid? id)
-       (when-let [e (d/entity db [:block/uuid id])]
-         (nil? (:block/page e)))))
+  (some? (d/entity db id)))
 
-;; FIXME: template instance check
-(defn- logseq-template?
+(defn- class-entity?
   [db id]
-  (and (uuid? id)
-       (some? (d/entity db [:block/uuid id]))))
+  (entity-util/class? (d/entity db id)))
 
-(defn- existing-closed-value-valid?
-  "Validates that the given existing closed value is valid"
-  [db property type-validate-fn value]
-  (boolean
-   (when-let [e (and (uuid? value)
-                     (d/entity db [:block/uuid value]))]
-     (let [values (get-in property [:block/schema :values])]
-       (and
-        (contains? (set values) value)
-        (if (contains? (:block/type e) "closed value")
-          (type-validate-fn (:value (:block/schema e)))
-          ;; page uuids aren't closed value types
-          (type-validate-fn value)))))))
+(defn- property-entity?
+  [db id]
+  (entity-util/property? (d/entity db id)))
 
-(defn type-or-closed-value?
-  "The `value` could be either a closed value (when `property` has pre-defined values) or it can be validated by `type-validate-fn`.
-  Args:
-  `new-closed-value?`: a new value will be added, so we'll check it using `type-validate-fn`."
-  [type-validate-fn]
-  (fn [db property value new-closed-value?]
-    (if (and (seq (get-in property [:block/schema :values]))
-             (not new-closed-value?))
-      (existing-closed-value-valid? db property type-validate-fn value)
-      (type-validate-fn value))))
+(defn- page-entity?
+  [db id]
+  (entity-util/page? (d/entity db id)))
+
+(defn- number-entity?
+  [db id-or-value {:keys [new-closed-value?]}]
+  (if new-closed-value?
+    (number? id-or-value)
+    (when-let [entity (d/entity db id-or-value)]
+      (number? (:logseq.property/value entity)))))
+
+(defn- text-entity?
+  [db s {:keys [new-closed-value?]}]
+  (if new-closed-value?
+    (string? s)
+    (when-let [ent (d/entity db s)]
+      (string? (:block/title ent)))))
+
+(defn- node-entity?
+  [db val]
+  (when-let [ent (d/entity db val)]
+    (some? (:block/title ent))))
+
+(defn- date?
+  [db val]
+  (when-let [ent (d/entity db val)]
+    (and (some? (:block/title ent))
+         (entity-util/journal? ent))))
 
 (def built-in-validation-schemas
   "Map of types to malli validation schemas that validate a property value for that type"
   {:default  [:fn
-              {:error/message "should be a text"}
-              ;; uuid check needed for property block values
-              (some-fn string? uuid?)]                     ; refs/tags will not be extracted
+              {:error/message "should be a text block"}
+              text-entity?]
    :number   [:fn
               {:error/message "should be a number"}
-              ;; TODO: Remove uuid? for :number and :url when type-or-closed-value? is used in this ns
-              (some-fn number? uuid?)]
+              number-entity?]
    :date     [:fn
               {:error/message "should be a journal date"}
-              logseq-page?]
+              date?]
+   :datetime [:fn
+              {:error/message "should be a datetime"}
+              number?]
    :checkbox boolean?
    :url      [:fn
               {:error/message "should be a URL"}
-              (some-fn url? uuid?)]
+              url-entity?]
+   :node   [:fn
+            {:error/message "should be a page/block with tags"}
+            node-entity?]
+
+   ;; Internal usage
+   ;; ==============
+
+   :string   string?
+   :raw-number number?
+   :entity   [:fn
+              {:error/message "should be an Entity"}
+              entity?]
+   :class    [:fn
+              {:error/message "should be a Class"}
+              class-entity?]
+   :property [:fn
+              {:error/message "should be a Property"}
+              property-entity?]
    :page     [:fn
-              {:error/message "should be a page"}
-              logseq-page?]
-   :template [:fn
-              {:error/message "should has #template"}
-              logseq-template?]
-   ;; internal usage
+              {:error/message "should be a Page"}
+              page-entity?]
    :keyword  keyword?
    :map      map?
    ;; coll elements are ordered as it's saved as a vec
@@ -127,12 +192,23 @@
 
 (def property-types-with-db
   "Property types whose validation fn requires a datascript db"
-  #{:date :page :template})
+  #{:default :url :number :date :node :entity :class :property :page})
 
 ;; Helper fns
 ;; ==========
-(defn property-type-allows-schema-attribute?
-  "Returns boolean to indicate if property type allows the given :schema attribute"
-  [property-type schema-attribute]
-  (contains? (get user-built-in-allowed-schema-attributes property-type)
-             schema-attribute))
+(defn infer-property-type-from-value
+  "Infers a user defined built-in :type from property value(s)"
+  [val]
+  (cond
+    (number? val) :number
+    (url? val) :url
+    (contains? #{true false} val) :checkbox
+    :else :default))
+
+(defn property-value-content?
+  "Whether property value should be stored in :logseq.property/value"
+  [block-type property]
+  (or
+   (original-value-ref-property-types (:logseq.property/type property))
+   (and (= (:db/ident property) :logseq.property/default-value)
+        (original-value-ref-property-types block-type))))

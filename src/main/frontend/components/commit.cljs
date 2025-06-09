@@ -9,7 +9,8 @@
             [goog.object :as gobj]
             [promesa.core :as p]
             [rum.core :as rum]
-            [logseq.shui.core :as shui]))
+            [logseq.shui.ui :as shui]
+            [frontend.persist-db :as persist-db]))
 
 (defn- commit-all!
   []
@@ -17,7 +18,7 @@
     (when (and value (>= (count value) 1))
       (when (util/electron?)
         (ipc/ipc "gitCommitAll" value))
-      (state/close-modal!))))
+      (shui/dialog-close!))))
 
 (defn prettify-git-status
   [status]
@@ -39,7 +40,7 @@
 (rum/defcs add-commit-message < rum/reactive
   (rum/local nil ::git-status)
   {:will-mount (fn [state]
-                 (-> (ipc/ipc "gitStatus")
+                 (-> (ipc/ipc "gitStatus" (state/get-current-repo))
                      (p/then (fn [status]
                                (reset! (get state ::git-status) status))))
                  state)
@@ -54,39 +55,38 @@
                       :node (gdom/getElement "commit-message")
                       :on-enter (fn []
                                   (commit-all!)))))
-  [state _close-fn]
+  [state]
   (let [*git-status (get state ::git-status)]
-    [:div.w-full.mx-auto.sm:max-w-lg.sm:w-96 {:style {:padding "48px 0"}}
+    [:div.w-full.mx-auto
      (if (empty? @*git-status)
        [:<>
         [:div.sm:flex.sm:items-start
-         [:div.mt-3.text-center.sm:mt-0.sm:text-left.mb-2
-          [:h3#modal-headline.text-lg.leading-6.font-medium
-           "No changes to commit!"]]]
-        [:div.mt-5.sm:mt-4.flex
-         (shui/button
-          {:text "Close"
-           :on-click state/close-modal!}
-          (shui/make-context))]]
+         [:div.mt-4.text-center.sm:mt-0.sm:text-left.mb-0
+          [:h3.text-lg.leading-6.font-medium
+           "No changes to commit!"]]]]
 
        [:<>
         [:div.sm:flex.sm:items-start
-         [:div.mt-3.text-center.sm:mt-0.sm:text-left.mb-2
+         [:div.mt-3.text-center.sm:mt-0.sm:text-left.mb-2.w-full
           (if (nil? @*git-status)
             [:div "Loading..."]
-            [:div "You have uncommitted changes"
-             [:pre (prettify-git-status @*git-status)]])
+            [:div.flex.w-full.flex-col
+             [:h2.text-xl "You have uncommitted changes: "]
+             [:pre.max-h-96.overflow-y-auto.bg-gray-02
+              (prettify-git-status @*git-status)]])
           [:h3#modal-headline.text-lg.leading-6.font-medium
            "Your commit message:"]]]
         [:input#commit-message.form-input.block.w-full.sm:text-sm.sm:leading-5.my-2
          {:auto-focus true
           :default-value ""}]
-        [:div.mt-5.sm:mt-4.flex
+        [:div.mt-5.sm:mt-4.flex.justify-end.pt-4
          (shui/button
-           {:text "Commit"
-           :on-click commit-all!}
-          (shui/make-context))]])]))
+           {:on-click #(commit-all!)}
+           "Commit")]])]))
 
 (defn show-commit-modal! [e]
-  (state/set-modal! add-commit-message)
-  (when e (util/stop e)))
+  (p/do!
+   (persist-db/export-current-graph!)
+   (shui/dialog-open! add-commit-message
+     {:content-props {:onOpenAutoFocus #(.preventDefault %)}})
+   (when e (util/stop e))))

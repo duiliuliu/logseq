@@ -1,5 +1,5 @@
-import * as fs from 'fs'
-import * as path from 'path'
+import fs from 'fs'
+import path from 'path'
 import { test as base, expect, ConsoleMessage, Locator } from '@playwright/test';
 import { ElectronApplication, Page, BrowserContext, _electron as electron } from 'playwright'
 import { loadLocalGraph, openLeftSidebar, randomString } from './utils';
@@ -125,6 +125,10 @@ base.beforeEach(async () => {
     await page.keyboard.press('Escape')
 
     await expect(page.locator('.notification-close-button')).not.toBeVisible()
+
+    if (await page.locator('.notification-clear button').isVisible()) {
+      await page.locator('.notification-clear button').click()
+    }
 
     const rightSidebar = page.locator('.cp__right-sidebar-inner')
     if (await rightSidebar.isVisible()) {

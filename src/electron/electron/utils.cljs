@@ -151,7 +151,6 @@
         (logger/warn "Unknown PAC rule:" line)
         nil))))
 
-
 (defn <get-system-proxy
   "Get system proxy for url, requires proxy to be set to system"
   ([] (<get-system-proxy "https://www.google.com"))
@@ -209,10 +208,10 @@
 
 (defn save-proxy-settings
   "Save proxy settings to configs.edn"
-  [{:keys [type host port test] :or {type "system"}}]
+  [{test' :test :keys [type host port] :or {type "system"}}]
   (if (or (= type "system") (= type "direct"))
-    (cfgs/set-item! :settings/agent {:type type :test test})
-    (cfgs/set-item! :settings/agent {:type type :protocol type :host host :port port :test test})))
+    (cfgs/set-item! :settings/agent {:type type :test test'})
+    (cfgs/set-item! :settings/agent {:type type :protocol type :host host :port port :test test'})))
 
 (defn should-read-content?
   "Skip reading content of file while using file-watcher"
@@ -295,3 +294,10 @@
     (catch :default _
       (println "decodeURIComponent failed: " uri)
       uri)))
+
+(defn fs-stat->clj
+  [path]
+  (let [stat (fs/statSync path)]
+    {:size (.-size stat)
+     :mtime (.-mtime stat)
+     :ctime (.-ctime stat)}))

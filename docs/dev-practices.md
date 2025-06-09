@@ -7,17 +7,19 @@ This page describes development practices for this codebase.
 Most of our linters require babashka. Before running them, please [install babashka](https://github.com/babashka/babashka#installation). To invoke all the linters in this section, run
 
 ```sh
-bb dev:lint
+bb lint:dev
 ```
 
 ### Clojure code
 
 To lint:
 ```sh
-clojure -M:clj-kondo --parallel --lint src --cache false
+clojure -M:clj-kondo --parallel --lint src
 ```
 
 We lint our Clojure(Script) code with https://github.com/clj-kondo/clj-kondo/. If you need to configure specific linters, see [this documentation](https://github.com/clj-kondo/clj-kondo/blob/master/doc/linters.md). Where possible, a global linting configuration is used and namespace specific configuration is avoided.
+
+For engineers, there is a faster version of this command that only checks files that you have changed: `bb lint:kondo-git-changes`.
 
 There are outstanding linting items that are currently ignored to allow linting the rest of the codebase in CI. These outstanding linting items should be addressed at some point:
 
@@ -90,8 +92,7 @@ translations here are some things to keep in mind:
   fn translation. Hiccup vectors are needed when word order matters for a
   translation and formatting is involved. See [this 3 word Turkish
   example](https://github.com/logseq/logseq/commit/1d932f07c4a0aad44606da6df03a432fe8421480#r118971415).
-* Translations can have arguments for interpolating strings. When they do, be
-  sure translators are using them correctly.
+* Translations can be anonymous fns with arguments for interpolating strings. Fns should be simple and only include the following fns: `str`, `when`, `if` and `=`.
 
 ### Spell Checker
 
@@ -120,6 +121,16 @@ $ bb lint:db-and-file-graphs-separate
 ```
 
 The main convention is that file and db specific files go under directories named `file_based` and `db_based` respectively. To see the full list of file and db specific namespaces and files see the top of [the script](/scripts/src/logseq/tasks/dev/db_and_file_graphs.clj).
+
+### Separate Worker from Frontend
+
+The worker and frontend code share common code from deps/ and `frontend.common.*`. However, the worker should never depend on other frontend namespaces as it could pull in libraries like React which cause it to fail hard. Likewise the frontend should never depend on worker namespaces. Run this linter to ensure worker and frontend namespaces don't require each other:
+
+```
+$ bb lint:worker-and-frontend-separate
+Valid worker namespaces!
+Valid frontend namespaces!
+```
 
 ## Testing
 
@@ -304,7 +315,7 @@ We strive to use explicit names that are self explanatory so that our codebase i
 
 ### Babashka tasks
 
-There are a number of bb tasks under `dev:` for developers. Some useful ones to
+There are a number of bb tasks under `dev:` for development. Some useful ones to
 point out:
 
 * `dev:validate-repo-config-edn` - Validate a repo config.edn
@@ -321,10 +332,21 @@ point out:
   ```sh
   # One time setup
   $ cd scripts && yarn install && cd -
-  # Build the export
+
+  # Build a release publishing app
   $ bb dev:publishing /path/to/graph-dir tmp/publish
-  # View the app in a browser
-  $ open tmp/publish/index.html
+
+  # OR build a dev publishing app that watches frontend changes
+  $ bb dev:publishing /path/to/graph-dir tmp/publish --dev
+
+  # View the publishing app in a browser
+  $ python3 -m http.server 8080 -d tmp/publish &; open http://localhost:8080
+
+  # Rebuild the publishing backend for dev/release.
+  # Handy when making backend changes in deps/publishing or
+  # to test a different graph
+  $ bb dev:publishing-backend /path/graph-dir tmp/publish
+
   ```
 
 There are also some tasks under `nbb:` which are useful for inspecting database
@@ -336,14 +358,14 @@ docs](https://github.com/logseq/bb-tasks#logseqbb-tasksnbbwatch) for more info.
 These tasks are specific to database graphs. For these tasks there is a one time setup:
 
 ```sh
-  $ cd deps/db && yarn install && cd ../outliner && yarn install && cd ../..
+  $ cd deps/db && yarn install && cd ../outliner && yarn install && cd ../graph-parser && yarn install && cd ../..
 ```
 
 * `dev:validate-db` - Validates a DB graph's datascript schema
 
   ```sh
   # One or more graphs can be validated e.g.
-  $ bb dev:validate-db test-db schema -c -g
+  $ bb dev:validate-db test-db schema
   Read graph test-db with 1572 datoms, 220 entities and 13 properties
   Valid!
   Read graph schema with 26105 datoms, 2320 entities and 3168 properties
@@ -355,7 +377,7 @@ These tasks are specific to database graphs. For these tasks there is a one time
   ```sh
   $ bb dev:db-query woot '[:find (pull ?b [*]) :where (block-content ?b "Dogma")]'
   DB contains 833 datoms
-  [{:block/tx-id 536870923, :block/link #:db{:id 100065}, :block/uuid #uuid "65565c26-f972-4400-bce4-a15df488784d", :block/updated-at 1700158508564, :block/left #:db{:id 100051}, :block/refs [#:db{:id 100064}], :block/created-at 1700158502056, :block/format :markdown, :block/tags [#:db{:id 100064}], :block/content "Dogma #~^65565c2a-b1c5-4dc8-a0f0-81b786bc5c6d", :db/id 100090, :block/path-refs [#:db{:id 100051} #:db{:id 100064}], :block/parent #:db{:id 100051}, :block/page #:db{:id 100051}}]
+  [{:block/tx-id 536870923, :block/link #:db{:id 100065}, :block/uuid #uuid "65565c26-f972-4400-bce4-a15df488784d", :block/updated-at 1700158508564, :block/order "a0", :block/refs [#:db{:id 100064}], :block/created-at 1700158502056, :block/format :markdown, :block/tags [#:db{:id 100064}], :block/title "Dogma #[[65565c2a-b1c5-4dc8-a0f0-81b786bc5c6d]]", :db/id 100090, :block/path-refs [#:db{:id 100051} #:db{:id 100064}], :block/parent #:db{:id 100051}, :block/page #:db{:id 100051}}]
   ```
 
 * `dev:db-transact` - Run a `d/transact!` against the queried results of a DB graph
@@ -375,6 +397,113 @@ These tasks are specific to database graphs. For these tasks there is a one time
   # When the transact looks good, run it without the flag
   $ bb dev:db-transact test-db '[:find ?b :where [?b :block/type "object"]]' '(fn [id] (vector :db/retract id :block/type "object"))'
   Updated 16 block(s) for graph test-db!
+  ```
+
+* `dev:db-create` - Create a DB graph given a `sqlite.build` EDN file
+
+  First in Electron, create the name of the graph you want create e.g. `inferred`.
+  Then:
+
+  ```sh
+  bb dev:db-create inferred deps/db/script/create_graph/inferred.edn
+  Generating 11 pages and 0 blocks ...
+  Created graph inferred!
+  ```
+
+  Finally, upload this created graph with the dev command: `Replace graph with
+  its db.sqlite file`. You'll be switched to the graph and you can use it!
+
+* `dev:db-import` and `dev:db-import-many` - Imports a file graph to DB graph, for one or many graphs
+
+  ```sh
+  # Import the local test graph with the debug option
+  $ bb dev:db-import deps/graph-parser/test/resources/exporter-test-graph test-file-graph -d
+  Importing 43 files ...
+  ...
+
+  # Import and validate multiple file graphs and write them to ./out/
+  $ bb dev:db-import-many /path/to/foo /path/to/bar -d
+  Importing ./out/foo ...
+  Importing 321 files ...
+  Valid!
+  Importing ./out/bar ...
+  Importing 542 files ...
+  Valid!
+  ```
+
+* `dev:db-datoms` and `dev:diff-datoms` - Save a db's datoms to file and diff two datom files
+
+  ```sh
+  # Save a current datoms snapshot of a graph
+  $ bb dev:db-datoms woot w2.edn
+  # After some edits, save another datoms snapshot
+  $ bb dev:db-datoms woot w3.edn
+
+  # Diff the two datom snapshots
+  # This snapshot correctly shows an added block with content "b7" and a property using a closed :default value
+  $  bb dev:diff-datoms w2.edn w3.edn
+  [[]
+  [[162 :block/title "b7" 536871039 true]
+    [162 :block/created-at 1703004379103 536871037 true]
+    [162 :block/format :markdown 536871037 true]
+    [162 :block/page 149 536871037 true]
+    [162 :block/parent 149 536871037 true]
+    [162 :block/path-refs 108 536871044 true]
+    [162 :block/path-refs 149 536871044 true]
+    [162 :block/path-refs 160 536871044 true]
+    [162
+    :block/properties
+    {#uuid "21be4275-bba9-48b8-9351-c9ca27883159"
+      #uuid "6581b09e-8b9c-4dca-a938-c900aedc8275"}
+    536871043
+    true]
+    [162 :block/refs 108 536871043 true]
+    [162 :block/refs 160 536871043 true]
+    [162
+    :block/uuid
+    #uuid "6581c8db-a2a2-4e09-b30d-cdea6ad69512"
+    536871037
+    true]]]
+
+  # By default this task ignores commonly changing datascript attributes.
+  # To see all changed attributes, tell the task to ignore a nonexistent attribute:
+  $ bb dev:diff-datoms w2.edn w3.edn -i a
+  [[[nil nil 536871029 536871030]
+    [nil nil 1702998192728 536871029]
+    [nil nil 536871035 536871036]
+    [nil nil 1703000139716 536871035]
+    [nil nil 149 536871033]
+    [nil nil 536871035 536871036]]
+  [[nil nil 536871041 536871042]
+    [nil nil 1703004384793 536871041]
+    [nil nil 536871039 536871040]
+    [nil nil 1703004380918 536871039]
+    [nil nil 162 536871037]
+    [nil nil 536871037 536871038]
+    [162 :block/title "b7" 536871039 true]
+    [162 :block/created-at 1703004379103 536871037 true]
+    [162 :block/format :markdown 536871037 true]
+    [162 :block/order "a0" 536871037 true]
+    [162 :block/page 149 536871037 true]
+    [162 :block/parent 149 536871037 true]
+    [162 :block/path-refs 108 536871044 true]
+    [162 :block/path-refs 149 536871044 true]
+    [162 :block/path-refs 160 536871044 true]
+    [162
+    :block/properties
+    {#uuid "21be4275-bba9-48b8-9351-c9ca27883159"
+      #uuid "6581b09e-8b9c-4dca-a938-c900aedc8275"}
+    536871043
+    true]
+    [162 :block/refs 108 536871043 true]
+    [162 :block/refs 160 536871043 true]
+    [162 :block/tx-id 536871043 536871044 true]
+    [162 :block/updated-at 1703004380918 536871039 true]
+    [162
+    :block/uuid
+    #uuid "6581c8db-a2a2-4e09-b30d-cdea6ad69512"
+    536871037
+    true]]]
   ```
 
 ### Dev Commands

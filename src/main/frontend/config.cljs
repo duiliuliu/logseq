@@ -5,27 +5,22 @@
             [frontend.mobile.util :as mobile-util]
             [frontend.state :as state]
             [frontend.util :as util]
-            [logseq.common.path :as path]
-            [logseq.graph-parser.config :as gp-config]
-            [logseq.graph-parser.util :as gp-util]
-            [shadow.resource :as rc]
+            [goog.crypt :as crypt]
             [goog.crypt.Md5]
-            [goog.crypt :as crypt]))
+            [logseq.common.config :as common-config]
+            [logseq.common.path :as path]
+            [logseq.common.util :as common-util]
+            [logseq.db.sqlite.util :as sqlite-util]
+            [shadow.resource :as rc]))
 
 (goog-define DEV-RELEASE false)
 (defonce dev-release? DEV-RELEASE)
 (defonce dev? ^boolean (or dev-release? goog.DEBUG))
 
-(goog-define PUBLISHING false)
-(defonce publishing? PUBLISHING)
+(defonce publishing? common-config/PUBLISHING)
 
 (goog-define REVISION "unknown")
 (defonce revision REVISION)
-
-(reset! state/publishing? publishing?)
-
-(goog-define TEST false)
-(def test? TEST)
 
 (goog-define ENABLE-FILE-SYNC-PRODUCTION false)
 
@@ -45,8 +40,7 @@
       (def USER-POOL-ID "us-east-1_dtagLnju8")
       (def IDENTITY-POOL-ID "us-east-1:d6d3b034-1631-402b-b838-b44513e93ee0")
       (def OAUTH-DOMAIN "logseq-prod.auth.us-east-1.amazoncognito.com")
-      (def CONNECTIVITY-TESTING-S3-URL "https://logseq-connectivity-testing-prod.s3.us-east-1.amazonaws.com/logseq-connectivity-testing")
-      )
+      (def CONNECTIVITY-TESTING-S3-URL "https://logseq-connectivity-testing-prod.s3.us-east-1.amazonaws.com/logseq-connectivity-testing"))
 
   (do (def FILE-SYNC-PROD? false)
       (def LOGIN-URL
@@ -60,7 +54,6 @@
       (def IDENTITY-POOL-ID "us-east-2:cc7d2ad3-84d0-4faf-98fe-628f6b52c0a5")
       (def OAUTH-DOMAIN "logseq-test2.auth.us-east-2.amazoncognito.com")
       (def CONNECTIVITY-TESTING-S3-URL "https://logseq-connectivity-testing-prod.s3.us-east-1.amazonaws.com/logseq-connectivity-testing")))
-
 
 (goog-define ENABLE-RTC-SYNC-PRODUCTION false)
 (if ENABLE-RTC-SYNC-PRODUCTION
@@ -78,23 +71,20 @@
 
 ;; User level configuration for whether plugins are enabled
 (defonce lsp-enabled?
-         (and (util/electron?)
-              (not (false? feature-plugin-system-on?))
-              (state/lsp-enabled?-or-theme)))
+  (and util/plugin-platform?
+       (not (false? feature-plugin-system-on?))
+       (state/lsp-enabled?-or-theme)))
 
 (defn plugin-config-enabled?
   []
   (and lsp-enabled? (global-config-enabled?)))
-
-;; TODO: switch to `logseq-team` group check later @zhiyuan
-(def db-graph-enabled? true)
 
 ;; :TODO: How to do this?
 ;; (defonce desktop? ^boolean goog.DESKTOP)
 
 ;; ============
 
-(def app-name "logseq")
+(def app-name common-config/app-name)
 (def website
   (if dev?
     "http://localhost:3000"
@@ -130,7 +120,7 @@
   #{:doc :docx :xls :xlsx :ppt :pptx :one :pdf :epub})
 
 (def image-formats
-  #{:png :jpg :jpeg :bmp :gif :webp :svg})
+  #{:png :jpg :jpeg :bmp :gif :webp :svg :heic})
 
 (def audio-formats
   #{:mp3 :ogg :mpeg :wav :m4a :flac :wma :aac})
@@ -138,14 +128,14 @@
 (def video-formats
   #{:mp4 :webm :mov :flv :avi :mkv})
 
-(def media-formats (set/union (gp-config/img-formats) audio-formats))
+(def media-formats (set/union (common-config/img-formats) audio-formats video-formats))
 
 (defn extname-of-supported?
   ([input] (extname-of-supported?
             input
             [image-formats doc-formats audio-formats
              video-formats markup-formats
-             (gp-config/text-formats)]))
+             (common-config/text-formats)]))
   ([input formats]
    (when-let [input (some->
                      (cond-> input
@@ -155,26 +145,26 @@
                      (util/safe-lower-case)
                      (keyword))]
      (boolean
-       (some
-         (fn [s]
-           (contains? s input))
-         formats)))))
+      (some
+       (fn [s]
+         (contains? s input))
+       formats)))))
 
 (defn ext-of-video?
   ([s] (ext-of-video? s true))
   ([s html5?]
    (when-let [s (and (string? s) (util/get-file-ext s))]
-     (let [video-formats (cond-> video-formats
-                                 html5? (disj :mkv))]
-       (extname-of-supported? s [video-formats])))))
+     (let [video-formats' (cond-> video-formats
+                            html5? (disj :mkv))]
+       (extname-of-supported? s [video-formats'])))))
 
 (defn ext-of-audio?
   ([s] (ext-of-audio? s true))
   ([s html5?]
    (when-let [s (and (string? s) (util/get-file-ext s))]
-     (let [audio-formats (cond-> audio-formats
-                                 html5? (disj :wma :ogg))]
-       (extname-of-supported? s [audio-formats])))))
+     (let [audio-formats' (cond-> audio-formats
+                            html5? (disj :wma :ogg))]
+       (extname-of-supported? s [audio-formats'])))))
 
 (defn ext-of-image?
   [s]
@@ -195,7 +185,7 @@
 
 (defn get-block-pattern
   [format]
-  (gp-config/get-block-pattern (or format (state/get-preferred-format))))
+  (common-config/get-block-pattern (or format (state/get-preferred-format))))
 
 (defn get-hr
   [format]
@@ -339,14 +329,15 @@
   []
   (or (state/get-whiteboards-directory) default-whiteboards-directory))
 
-(defonce local-repo "local")
+(defonce demo-repo "Demo")
 
 (defn demo-graph?
   "Demo graph or nil graph?"
   ([]
    (demo-graph? (state/get-current-repo)))
   ([repo-url]
-   (or (nil? repo-url) (= repo-url local-repo))))
+   (or (nil? repo-url) (= repo-url demo-repo)
+       (string/ends-with? repo-url demo-repo))))
 
 (defonce recycle-dir ".recycle")
 (def config-file "config.edn")
@@ -369,7 +360,7 @@
 (defonce idb-db-prefix "logseq-db/")
 (defonce local-db-prefix "logseq_local_")
 (defonce local-handle "handle")
-(defonce db-version-prefix "logseq_db_")
+(defonce db-version-prefix sqlite-util/db-version-prefix)
 
 (defn local-file-based-graph?
   [s]
@@ -377,10 +368,12 @@
        (string/starts-with? s local-db-prefix)))
 
 (defn db-based-graph?
-  [s]
-  (boolean
-   (and (string? s)
-                (string/starts-with? s db-version-prefix))))
+  ([]
+   (db-based-graph? (state/get-current-repo)))
+  ([s]
+   (boolean
+    (and (string? s)
+         (sqlite-util/db-based-graph? s)))))
 
 (defn get-local-asset-absolute-path
   [s]
@@ -402,48 +395,44 @@
 
 (defn get-repo-dir
   [repo-url]
-  (let [db-based? (db-based-graph? repo-url)]
-    (cond
-      (nil? repo-url)
-      (do
-        (js/console.error "BUG: nil repo")
-        nil)
+  (when repo-url
+    (let [db-based? (db-based-graph? repo-url)]
+      (cond
+        (and (util/electron?) db-based-graph?)
+        (get-local-dir repo-url)
 
-      (and (util/electron?) db-based-graph?)
-      (get-local-dir repo-url)
+        db-based?
+        (str "memory:///"
+             (string/replace-first repo-url db-version-prefix ""))
 
-      db-based?
-      (str "memory:///"
-           (string/replace-first repo-url db-version-prefix ""))
+        (and (util/electron?) (local-file-based-graph? repo-url))
+        (get-local-dir repo-url)
 
-      (and (util/electron?) (local-file-based-graph? repo-url))
-      (get-local-dir repo-url)
-
-      (and (mobile-util/native-platform?) (local-file-based-graph? repo-url))
-      (let [dir (get-local-dir repo-url)]
-        (if (string/starts-with? dir "file://")
-          dir
-          (path/path-join "file://" dir)))
+        (and (mobile-util/native-platform?) (local-file-based-graph? repo-url))
+        (let [dir (get-local-dir repo-url)]
+          (if (string/starts-with? dir "file://")
+            dir
+            (path/path-join "file://" dir)))
 
     ;; Special handling for demo graph
-      (= repo-url "local")
-      "memory:///local"
+        (= repo-url demo-repo)
+        "memory:///local"
 
     ;; nfs, browser-fs-access
     ;; Format: logseq_local_{dir-name}
-      (local-file-based-graph? repo-url)
-      (string/replace-first repo-url local-db-prefix "")
+        (local-file-based-graph? repo-url)
+        (string/replace-first repo-url local-db-prefix "")
 
      ;; unit test
-      (= repo-url "test-db")
-      "/test-db"
+        (= repo-url "test-db")
+        "/test-db"
 
-      :else
-      (do
-        (js/console.error "Unknown Repo URL type:" repo-url)
-        (str "/"
-             (->> (take-last 2 (string/split repo-url #"/"))
-                  (string/join "_")))))))
+        :else
+        (do
+          (js/console.error "Unknown Repo URL type:" repo-url)
+          (str "/"
+               (->> (take-last 2 (string/split repo-url #"/"))
+                    (string/join "_"))))))))
 
 (defn get-string-repo-dir
   [repo-dir]
@@ -460,7 +449,7 @@
                  "Local"))
          (->> (string/split repo-dir "Documents/")
               last
-              gp-util/safe-decode-uri-component
+              common-util/safe-decode-uri-component
               (str "/" (string/capitalize app-name) "/")))
     (get-repo-dir (get-local-repo repo-dir))))
 
@@ -499,18 +488,23 @@
           ;; BUG: use "assets" as fake current directory
           assets-link-fn (fn [_]
                            (let [graph-root (get-repo-dir (state/get-current-repo))
-                                 protocol (if (string/starts-with? graph-root "file:") "" protocol)
-                                 full-path (path/path-join protocol graph-root "assets")]
+                                 full-path (if (util/safe-re-find #"^(file|assets):" graph-root)
+                                             (path/path-join graph-root "assets")
+                                             (path/path-join protocol graph-root "assets"))]
                              (str (cond-> full-path
-                                          (mobile-util/native-platform?)
-                                          (mobile-util/convert-file-src))
+                                    (mobile-util/native-platform?)
+                                    (mobile-util/convert-file-src))
                                   "/")))]
       (string/replace source #"\.\./assets/" assets-link-fn))))
 
 (defn get-current-repo-assets-root
   []
-  (when-let [repo-dir (and (local-file-based-graph? (state/get-current-repo))
-                           (get-repo-dir (state/get-current-repo)))]
+  (when-let [repo-dir (get-repo-dir (state/get-current-repo))]
+    (path/path-join repo-dir "assets")))
+
+(defn get-repo-assets-root
+  [repo]
+  (when-let [repo-dir (get-repo-dir repo)]
     (path/path-join repo-dir "assets")))
 
 (defn get-custom-js-path
@@ -525,5 +519,3 @@
 (defn get-block-hidden-properties
   []
   (:block-hidden-properties (state/get-config)))
-
-(defonce page-ref-special-chars "~^")

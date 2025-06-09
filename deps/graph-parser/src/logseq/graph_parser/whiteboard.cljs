@@ -1,14 +1,10 @@
 (ns logseq.graph-parser.whiteboard
   "Whiteboard related parser utilities"
-  (:require [logseq.graph-parser.util :as gp-util]
-            [logseq.graph-parser.util.block-ref :as block-ref]
-            [logseq.graph-parser.util.page-ref :as page-ref]))
+  (:require [logseq.db.common.property-util :as db-property-util]
+            [logseq.db.sqlite.util :as sqlite-util]))
 
 (defn block->shape [block]
   (get-in block [:block/properties :logseq.tldraw.shape]))
-
-(defn page-block->tldr-page [block]
-  (get-in block [:block/properties :logseq.tldraw.page]))
 
 (defn shape-block? [block]
   (= :whiteboard-shape (get-in block [:block/properties :ls-type])))
@@ -41,48 +37,57 @@
       (assoc block :block/properties properties))
     block))
 
-
 (defn- get-shape-refs [shape]
   (let [portal-refs (when (= "logseq-portal" (:type shape))
-                      [(if (= (:blockType shape) "P")
-                         {:block/name (gp-util/page-name-sanity-lc (:pageId shape))}
-                         {:block/uuid (uuid (:pageId shape))})])
+                      [{:block/uuid (uuid (:pageId shape))}])
         shape-link-refs (->> (:refs shape)
                              (filter (complement empty?))
-                             (map (fn [ref] (if (parse-uuid ref)
-                                              {:block/uuid (parse-uuid ref)}
-                                              {:block/name (gp-util/page-name-sanity-lc ref)}))))]
+                             (keep (fn [ref] (when (parse-uuid ref)
+                                               {:block/uuid (parse-uuid ref)}))))]
     (concat portal-refs shape-link-refs)))
 
 (defn- with-whiteboard-block-refs
-  [shape page-name]
+  [shape page-id]
   (let [refs (or (get-shape-refs shape) [])]
     (merge {:block/refs (if (seq refs) refs [])
             :block/path-refs (if (seq refs)
-                               (conj refs {:block/name page-name})
+                               (conj refs page-id)
                                [])})))
 
 (defn- with-whiteboard-content
   "Main purpose of this function is to populate contents when shapes are used as references in outliner."
   [shape]
-  {:block/content (case (:type shape)
-                    "text" (:text shape)
-                    "logseq-portal" (if (= (:blockType shape) "P")
-                                      (page-ref/->page-ref (:pageId shape))
-                                      (block-ref/->block-ref (:pageId shape)))
-                    "line" (str "whiteboard arrow" (when-let [label (:label shape)] (str ": " label)))
-                    (str "whiteboard " (:type shape)))})
+  {:block/title (case (:type shape)
+                  "text" (:text shape)
+                  "logseq-portal" ""
+                  "line" (str "whiteboard arrow" (when-let [label (:label shape)] (str ": " label)))
+                  (str "whiteboard " (:type shape)))})
 
 (defn with-whiteboard-block-props
-  [block page-name]
+  "Builds additional block attributes for a whiteboard block. Expects :block/properties
+   to be in file graph format"
+  [block page-id]
   (let [shape? (shape-block? block)
-        shape (block->shape block)
-        default-page-ref {:block/name (gp-util/page-name-sanity-lc page-name)}]
+        shape (block->shape block)]
     (merge (when shape?
              (merge
               {:block/uuid (uuid (:id shape))}
-              (with-whiteboard-block-refs shape page-name)
+              (with-whiteboard-block-refs shape page-id)
               (with-whiteboard-content shape)))
-           (when (nil? (:block/parent block)) {:block/parent default-page-ref})
+           (when (nil? (:block/parent block)) {:block/parent page-id})
            (when (nil? (:block/format block)) {:block/format :markdown}) ;; TODO: read from config
-           {:block/page default-page-ref})))
+           {:block/page page-id})))
+
+(defn shape->block [repo shape page-id]
+  (let [block-uuid (if (uuid? (:id shape)) (:id shape) (uuid (:id shape)))
+        properties {(db-property-util/get-pid repo :logseq.property/ls-type) :whiteboard-shape
+                    (db-property-util/get-pid repo :logseq.property.tldraw/shape) shape}
+        block {:block/uuid block-uuid
+               :block/title ""
+               :block/page page-id
+               :block/parent page-id}
+        block' (if (sqlite-util/db-based-graph? repo)
+                 (merge block properties)
+                 (assoc block :block/properties properties))
+        additional-props (with-whiteboard-block-props block' page-id)]
+    (merge block' additional-props)))

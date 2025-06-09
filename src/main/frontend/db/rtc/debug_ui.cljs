@@ -1,202 +1,339 @@
 (ns frontend.db.rtc.debug-ui
   "Debug UI for rtc module"
-  (:require-macros
-   [frontend.db.rtc.macro :refer [with-sub-data-from-ws get-req-id get-result-ch]])
-  (:require [cljs.core.async :as async :refer [<! go]]
-            [fipp.edn :as fipp]
-            [frontend.async-util :include-macros true :refer [<? go-try]]
+  (:require [fipp.edn :as fipp]
+            [frontend.common.missionary :as c.m]
             [frontend.db :as db]
-            [frontend.db.conn :as conn]
-            [frontend.db.rtc.core :as rtc-core]
-            [frontend.db.rtc.db-listener :as db-listener]
-            [frontend.db.rtc.full-upload-download-graph :as full-upload-download-graph]
-            [frontend.db.rtc.op-mem-layer :as op-mem-layer]
-            [frontend.db.rtc.ws :as ws]
-            [frontend.handler.notification :as notification]
+            [frontend.handler.db-based.rtc-flows :as rtc-flows]
             [frontend.handler.user :as user]
             [frontend.state :as state]
             [frontend.ui :as ui]
             [frontend.util :as util]
+            [logseq.db.frontend.schema :as db-schema]
+            [logseq.shui.ui :as shui]
+            [missionary.core :as m]
+            [promesa.core :as p]
             [rum.core :as rum]))
 
-(defonce debug-state (atom nil))
-
-(defn- <start-rtc
-  ([]
-   (go
-     (let [state (<! (rtc-core/<init-state))]
-       (<! (<start-rtc state)))))
-  ([state]
-   (go
-     (if (= :expired-token (:anom (ex-data state)))
-       (prn ::<start-rtc state)
-       (let [repo (state/get-current-repo)]
-         (<! (<start-rtc state repo))))))
-  ([state repo]
-   (go
-     (if-let [graph-uuid (op-mem-layer/get-graph-uuid repo)]
-       (do (reset! debug-state state)
-           (<! (rtc-core/<loop-for-rtc state graph-uuid repo))
-           state)
-       (do (notification/show! "not a rtc-graph" :error false)
-           nil)))))
+(defonce debug-state (:rtc/state @state/state))
 
 (defn- stop
   []
-  (async/close! @(:*stop-rtc-loop-chan @debug-state))
-  (reset! debug-state nil))
+  (p/do!
+   (state/<invoke-db-worker :thread-api/rtc-stop)
+   (reset! debug-state nil)))
 
-(defn- push-pending-ops
-  []
-  (async/put! (:force-push-client-ops-chan @debug-state) true))
-
-(defn- <download-graph
-  [repo graph-uuid]
-  (go-try
-   (let [state (<! (rtc-core/<init-state))]
-     (<? (full-upload-download-graph/<download-graph state repo graph-uuid)))))
-
-(defn- <upload-graph
-  []
-  (go
-    (let [state (<! (rtc-core/<init-state))
-          repo (state/get-current-repo)]
-      (<! (full-upload-download-graph/<upload-graph state repo))
-      (let [conn (conn/get-db repo false)]
-        (db-listener/listen-db-to-generate-ops repo conn)))))
-
-(rum/defcs ^:large-vars/cleanup-todo rtc-debug-ui <
-  rum/reactive
-  (rum/local nil ::graph-uuid)
-  (rum/local nil ::local-tx)
-  (rum/local nil ::unpushed-block-update-count)
-  (rum/local nil ::ws-state)
-  (rum/local nil ::download-graph-to-repo)
-  (rum/local nil ::remote-graphs)
-  (rum/local nil ::graph-uuid-to-download)
-  (rum/local nil ::grant-access-to-user)
-  (rum/local nil ::auto-push-updates?)
+(rum/defcs ^:large-vars/cleanup-todo rtc-debug-ui < rum/reactive
+  (rum/local nil ::logs)
+  (rum/local nil ::sub-log-canceler)
+  (rum/local nil ::keys-state)
+  {:will-mount (fn [state]
+                 (let [canceler
+                       (c.m/run-task ::sub-logs
+                         (m/reduce
+                          (fn [logs log]
+                            (let [logs* (if log
+                                          (take 10 (conj logs log))
+                                          logs)]
+                              (reset! (get state ::logs) logs*)
+                              logs*))
+                          nil rtc-flows/rtc-log-flow))]
+                   (reset! (get state ::sub-log-canceler) canceler)
+                   state))
+   :will-unmount (fn [state]
+                   (when-let [canceler (some-> (get state ::sub-log-canceler) deref)]
+                     (canceler))
+                   state)}
   [state]
-  (let [s (rum/react debug-state)
-        rtc-state (and s (rum/react (:*rtc-state s)))]
+  (let [debug-state* (rum/react debug-state)
+        rtc-logs @(get state ::logs)
+        rtc-state (:rtc-state debug-state*)
+        rtc-lock (:rtc-lock debug-state*)]
     [:div
-     [:div.flex
-      (ui/button "local-state"
-                 :class "mr-2"
-                 :icon "refresh"
-                 :on-click (fn [_]
-                             (go
-                               (let [repo (state/get-current-repo)
-                                     local-tx (op-mem-layer/get-local-tx repo)
-                                     unpushed-block-update-count (op-mem-layer/get-unpushed-block-update-count repo)
-                                     graph-uuid (op-mem-layer/get-graph-uuid repo)]
-                                 (reset! (::local-tx state) local-tx)
-                                 (reset! (::unpushed-block-update-count state) unpushed-block-update-count)
-                                 (reset! (::graph-uuid state) graph-uuid)
-                                 (reset! (::ws-state state) (and s (ws/get-state @(:*ws s))))
-                                 (reset! (::auto-push-updates? state) (and s @(:*auto-push-client-ops? s)))))))
-      (ui/button "graph-list"
-                 :icon "refresh"
-                 :on-click (fn [_]
-                             (go
-                               (let [s (or s (<! (rtc-core/<init-state)))
-                                     graph-list (with-sub-data-from-ws s
-                                                  (<! (ws/<send! s {:req-id (get-req-id)
-                                                                    :action "list-graphs"}))
-                                                  (:graphs (<! (get-result-ch))))]
-                                 (reset! (::remote-graphs state) (map :graph-uuid graph-list))
-                                 (reset! debug-state s)))))]
+     {:on-click (fn [^js e]
+                  (when-let [^js btn (.closest (.-target e) ".ui__button")]
+                    (.setAttribute btn "disabled" "true")
+                    (js/setTimeout #(.removeAttribute btn "disabled") 2000)))}
+     [:div.flex.gap-2.flex-wrap.items-center.pb-3
+      (shui/button
+       {:size :sm
+        :on-click (fn [_]
+                    (p/let [new-state (state/<invoke-db-worker :thread-api/rtc-get-debug-state)]
+                      (swap! debug-state (fn [old] (merge old new-state)))))}
+       (shui/tabler-icon "refresh") "state")
 
-     [:pre.select-text
-      (-> {:user-uuid (user/user-uuid)
-           :graph @(::graph-uuid state)
-           :rtc-state rtc-state
-           :ws (and s (ws/get-state @(:*ws s)))
-           :local-tx @(::local-tx state)
-           :pending-block-update-count @(::unpushed-block-update-count state)
-           :remote-graphs @(::remote-graphs state)
-           :auto-push-updates? @(::auto-push-updates? state)
-           :current-page (state/get-current-page)
-           :blocks-count (when-let [page (state/get-current-page)]
-                           (count (:block/_page (db/entity [:block/name (util/page-name-sanity-lc page)]))))}
-          (fipp/pprint {:width 20})
-          with-out-str)]
-     (if (or (nil? s)
-             (= :closed rtc-state))
-       (ui/button "start" {:class "my-2"
-                           :on-click (fn []
-                                       (prn :start-rtc)
-                                       (if s
-                                         (<start-rtc s)
-                                         (<start-rtc)))})
+      (shui/button
+       {:size :sm
+        :on-click
+        (fn [_]
+          (let [token (state/get-auth-id-token)]
+            (p/let [graph-list (state/<invoke-db-worker :thread-api/rtc-get-graphs token)]
+              (swap! debug-state assoc
+                     :remote-graphs
+                     (map
+                      #(into {}
+                             (filter second
+                                     (select-keys % [:graph-uuid
+                                                     :graph-schema-version
+                                                     :graph-name
+                                                     :graph-status
+                                                     :graph<->user-user-type
+                                                     :graph<->user-grant-by-user])))
+                      graph-list)))))}
+       (shui/tabler-icon "download") "graph-list")
+      (shui/button
+       {:size :sm
+        :on-click #(c.m/run-task :upload-test-avatar
+                     (user/new-task--upload-user-avatar "TEST_AVATAR"))}
+       (shui/tabler-icon "upload") "upload-test-avatar")]
+
+     [:div.pb-4
+      [:pre.select-text
+       (-> {:user-uuid (user/user-uuid)
+            :graph (:graph-uuid debug-state*)
+            :rtc-state rtc-state
+            :rtc-logs rtc-logs
+            :local-tx (:local-tx debug-state*)
+            :pending-block-update-count (:unpushed-block-update-count debug-state*)
+            :remote-graphs (:remote-graphs debug-state*)
+            :online-users (:online-users debug-state*)
+            :auto-push? (:auto-push? debug-state*)
+            :remote-profile? (:remote-profile? debug-state*)
+            :current-page (state/get-current-page)
+            :blocks-count (when-let [page (state/get-current-page)]
+                            (count (:block/_page (db/get-page page))))
+            :schema-version {:app (db-schema/schema-version->string db-schema/version)
+                             :local-graph (:local-graph-schema-version debug-state*)
+                             :remote-graph (str (:remote-graph-schema-version debug-state*))}}
+           (fipp/pprint {:width 20})
+           with-out-str)]]
+
+     (if (nil? rtc-lock)
+       (shui/button
+        {:variant :outline
+         :class "text-green-rx-09 border-green-rx-10 hover:text-green-rx-10"
+         :on-click (fn [] (state/<invoke-db-worker :thread-api/rtc-start false))}
+        (shui/tabler-icon "player-play") "start")
 
        [:div.my-2.flex
-        [:div.mr-2 (ui/button (str "send pending ops")
-                              {:on-click (fn [] (push-pending-ops))})]
         [:div.mr-2 (ui/button (str "Toggle auto push updates("
-                                   (if @(:*auto-push-client-ops? s)
+                                   (if (:auto-push? debug-state*)
                                      "ON" "OFF")
                                    ")")
                               {:on-click
                                (fn []
-                                 (go
-                                   (<! (rtc-core/<toggle-auto-push-client-ops s))
-                                   (reset! (::auto-push-updates? state) @(:*auto-push-client-ops? s))))})]
-        [:div (ui/button "stop" {:on-click (fn [] (stop))})]])
-     (when (some? s)
-       [:hr]
-       [:div.flex.flex-row
-        (ui/button "grant graph access to"
-                   {:class "mr-2"
-                    :on-click (fn []
-                                (go
-                                  (let [user-uuid (some-> @(::grant-access-to-user state) parse-uuid)
-                                        user-email (when-not user-uuid @(::grant-access-to-user state))]
-                                    (when-let [graph-uuid @(::graph-uuid state)]
-                                      (<! (rtc-core/<grant-graph-access-to-others
-                                           s graph-uuid
-                                           :target-user-uuids (some-> user-uuid vector)
-                                           :target-user-emails (some-> user-email vector)))))))})
+                                 (state/<invoke-db-worker :thread-api/rtc-toggle-auto-push))})]
+        [:div.mr-2 (ui/button (str "Toggle remote profile("
+                                   (if (:remote-profile? debug-state*)
+                                     "ON" "OFF")
+                                   ")")
+                              {:on-click
+                               (fn []
+                                 (state/<invoke-db-worker :thread-api/rtc-toggle-remote-profile))})]
+        [:div (shui/button
+               {:variant :outline
+                :class "text-red-rx-09 border-red-rx-08 hover:text-red-rx-10"
+                :size :sm
+                :on-click (fn [] (stop))}
+               (shui/tabler-icon "player-stop") "stop")]])
 
-        [:input.form-input.my-2
-         {:on-change (fn [e] (reset! (::grant-access-to-user state) (util/evalue e)))
+     (when (some? debug-state*)
+       [:hr]
+       [:div.flex.flex-row.items-center.gap-2
+        (ui/button "grant graph access to"
+                   {:icon "award"
+                    :on-click (fn []
+                                (let [token (state/get-auth-id-token)
+                                      user-uuid (some-> (:grant-access-to-user debug-state*) parse-uuid)
+                                      user-email (when-not user-uuid (:grant-access-to-user debug-state*))]
+                                  (when-let [graph-uuid (:graph-uuid debug-state*)]
+                                    (state/<invoke-db-worker :thread-api/rtc-grant-graph-access
+                                                             token graph-uuid
+                                                             (some-> user-uuid vector)
+                                                             (some-> user-email vector)))))})
+
+        [:b "➡️"]
+        [:input.form-input.my-2.py-1
+         {:on-change (fn [e] (swap! debug-state assoc :grant-access-to-user (util/evalue e)))
           :on-focus (fn [e] (let [v (.-value (.-target e))]
                               (when (= v "input email or user-uuid here")
                                 (set! (.-value (.-target e)) ""))))
-          :default-value "input email or user-uuid here"}]])
-     [:hr]
-     [:div.flex.flex-row
+          :placeholder "input email or user-uuid here"}]])
+
+     [:hr.my-2]
+
+     [:div.flex.flex-row.items-center.gap-2
       (ui/button (str "download graph to")
-                 {:class "mr-2"
+                 {:icon "download"
+                  :class "mr-2"
                   :on-click (fn []
-                              (go
-                                (when-let [repo @(::download-graph-to-repo state)]
-                                  (when-let [graph-uuid @(::graph-uuid-to-download state)]
-                                    (prn :download-graph graph-uuid :to repo)
-                                    (try
-                                      (<? (<download-graph repo graph-uuid))
-                                      (notification/show! "download graph successfully")
-                                      (catch :default e
-                                        (notification/show! "download graph failed" :error)
-                                        (prn ::download-graph-failed e)))))))})
-      [:div.flex.flex-col
-       [:select
-        {:on-change (fn [e]
-                      (let [value (util/evalue e)]
-                        (reset! (::graph-uuid-to-download state) value)))}
-        (if (seq @(::remote-graphs state))
-          (cons [:option {:key "select a remote graph" :value nil} "select a remote graph"]
-                (for [graph-uuid @(::remote-graphs state)]
-                  [:option {:key graph-uuid :value graph-uuid} (str (subs graph-uuid 0 14) "...")]))
-          (list [:option {:key "refresh-first" :value nil} "refresh remote-graphs first"]))]
-       [:input.form-input.my-2
-        {:on-change (fn [e] (reset! (::download-graph-to-repo state) (util/evalue e)))
+                              (when-let [graph-name (:download-graph-to-repo debug-state*)]
+                                (when-let [{:keys [graph-uuid graph-schema-version]}
+                                           (:graph-uuid-to-download debug-state*)]
+                                  (prn :download-graph graph-uuid graph-schema-version :to graph-name)
+                                  (p/let [token (state/get-auth-id-token)
+                                          download-info-uuid (state/<invoke-db-worker
+                                                              :thread-api/rtc-request-download-graph
+                                                              token graph-uuid graph-schema-version)
+                                          {:keys [_download-info-uuid
+                                                  download-info-s3-url
+                                                  _download-info-tx-instant
+                                                  _download-info-t
+                                                  _download-info-created-at]
+                                           :as result}
+                                          (state/<invoke-db-worker :thread-api/rtc-wait-download-graph-info-ready
+                                                                   token download-info-uuid graph-uuid graph-schema-version 60000)]
+                                    (when (not= result :timeout)
+                                      (assert (some? download-info-s3-url) result)
+                                      (state/<invoke-db-worker :thread-api/rtc-download-graph-from-s3
+                                                               graph-uuid graph-name download-info-s3-url))))))})
+
+      [:b "➡"]
+      [:div.flex.flex-row.items-center.gap-2
+       (shui/select
+        {:on-value-change (fn [[graph-uuid graph-schema-version]]
+                            (when (and (parse-uuid graph-uuid) graph-schema-version)
+                              (swap! debug-state assoc
+                                     :graph-uuid-to-download
+                                     {:graph-uuid graph-uuid
+                                      :graph-schema-version graph-schema-version})))}
+        (shui/select-trigger
+         {:class "!px-2 !py-0 !h-8 border-gray-04"}
+         (shui/select-value
+          {:placeholder "Select a graph-uuid"}))
+        (shui/select-content
+         (shui/select-group
+          (for [{:keys [graph-uuid graph-schema-version graph-status]} (sort-by :graph-uuid (:remote-graphs debug-state*))]
+            (shui/select-item {:value [graph-uuid graph-schema-version] :disabled (some? graph-status)} graph-uuid)))))
+
+       [:b "＋"]
+       [:input.form-input.my-2.py-1
+        {:on-change (fn [e] (swap! debug-state assoc :download-graph-to-repo (util/evalue e)))
          :on-focus (fn [e] (let [v (.-value (.-target e))]
                              (when (= v "repo name here")
                                (set! (.-value (.-target e)) ""))))
-         :default-value "repo name here"}]]]
-     [:div.flex.my-2
-      (ui/button (str "upload current repo") {:on-click (fn []
-                                                          (go
-                                                            (<! (<upload-graph))
-                                                            (notification/show! "upload graph successfully")))})]]))
+         :placeholder "repo name here"}]]]
+
+     [:div.flex.my-2.items-center.gap-2
+      (ui/button (str "upload current repo")
+                 {:icon "upload"
+                  :on-click (fn []
+                              (let [repo (state/get-current-repo)
+                                    token (state/get-auth-id-token)
+                                    remote-graph-name (:upload-as-graph-name debug-state*)]
+                                (state/<invoke-db-worker :thread-api/rtc-async-upload-graph
+                                                         repo token remote-graph-name)))})
+      [:b "➡️"]
+      [:input.form-input.my-2.py-1.w-32
+       {:on-change (fn [e] (swap! debug-state assoc :upload-as-graph-name (util/evalue e)))
+        :on-focus (fn [e] (let [v (.-value (.-target e))]
+                            (when (= v "remote graph name here")
+                              (set! (.-value (.-target e)) ""))))
+        :placeholder "remote graph name here"}]]
+
+     [:div.pb-2.flex.flex-row.items-center.gap-2
+      (ui/button (str "delete graph")
+                 {:icon "trash"
+                  :on-click (fn []
+                              (when-let [{:keys [graph-uuid graph-schema-version]} (:graph-uuid-to-delete debug-state*)]
+                                (let [token (state/get-auth-id-token)]
+                                  (prn ::delete-graph graph-uuid graph-schema-version)
+                                  (state/<invoke-db-worker :thread-api/rtc-delete-graph
+                                                           token graph-uuid graph-schema-version))))})
+
+      (shui/select
+       {:on-value-change (fn [[graph-uuid graph-schema-version]]
+                           (when (and (parse-uuid graph-uuid) graph-schema-version)
+                             (swap! debug-state assoc
+                                    :graph-uuid-to-delete
+                                    {:graph-uuid graph-uuid
+                                     :graph-schema-version graph-schema-version})))}
+       (shui/select-trigger
+        {:class "!px-2 !py-0 !h-8"}
+        (shui/select-value
+         {:placeholder "Select a graph-uuid"}))
+       (shui/select-content
+        (shui/select-group
+         (for [{:keys [graph-uuid graph-schema-version graph-status]} (:remote-graphs debug-state*)]
+           (shui/select-item {:value [graph-uuid graph-schema-version] :disabled (some? graph-status)} graph-uuid)))))]
+
+     [:div.pb-2.flex.flex-row.items-center.gap-2
+      (ui/button "Run server-migrations"
+                 {:on-click (fn []
+                              (let [repo (state/get-current-repo)]
+                                (when-let [server-schema-version (:server-schema-version debug-state*)]
+                                  (state/<invoke-db-worker :thread-api/rtc-add-migration-client-ops
+                                                           repo server-schema-version))))})
+      [:input.form-input.my-2.py-1.w-32
+       {:on-change (fn [e] (swap! debug-state assoc :server-schema-version (util/evalue e)))
+        :on-focus (fn [e] (let [v (.-value (.-target e))]
+                            (when (= v "server migration start version here(e.g. \"64.2\")")
+                              (set! (.-value (.-target e)) ""))))
+        :placeholder "server migration start version here(e.g. \"64.2\")"}]]
+
+     [:hr.my-2]
+
+     (let [*keys-state (get state ::keys-state)
+           keys-state @*keys-state]
+       [:div
+        [:div.pb-2.flex.flex-row.items-center.gap-2
+         (shui/button
+          {:size :sm
+           :on-click (fn [_]
+                       (p/let [graph-keys (state/<invoke-db-worker :thread-api/rtc-get-graph-keys (state/get-current-repo))
+                               devices (some->> (state/get-auth-id-token)
+                                                (state/<invoke-db-worker :thread-api/list-devices))]
+                         (swap! (get state ::keys-state) #(merge % graph-keys {:devices devices}))))}
+          (shui/tabler-icon "refresh") "keys-state")]
+        [:div.pb-4
+         [:pre.select-text
+          (-> {:devices (:devices keys-state)
+               :graph-aes-key-jwk (:aes-key-jwk keys-state)}
+              (fipp/pprint {:width 20})
+              with-out-str)]]
+        (shui/button
+         {:size :sm
+          :on-click (fn [_]
+                      (when-let [device-uuid (not-empty (:remove-device-device-uuid keys-state))]
+                        (when-let [token (state/get-auth-id-token)]
+                          (state/<invoke-db-worker :thread-api/remove-device token device-uuid))))}
+         "Remove device:")
+        [:input.form-input.my-2.py-1.w-32
+         {:on-change (fn [e] (swap! *keys-state assoc :remove-device-device-uuid (util/evalue e)))
+          :on-focus (fn [e] (let [v (.-value (.-target e))]
+                              (when (= v "device-uuid here")
+                                (set! (.-value (.-target e)) ""))))
+          :placeholder "device-uuid here"}]
+        (shui/button
+         {:size :sm
+          :on-click (fn [_]
+                      (when-let [device-uuid (not-empty (:remove-public-key-device-uuid keys-state))]
+                        (when-let [key-name (not-empty (:remove-public-key-key-name keys-state))]
+                          (when-let [token (state/get-auth-id-token)]
+                            (state/<invoke-db-worker :thread-api/remove-device-public-key token device-uuid key-name)))))}
+         "Remove public-key:")
+        [:input.form-input.my-2.py-1.w-32
+         {:on-change (fn [e] (swap! *keys-state assoc :remove-public-key-device-uuid (util/evalue e)))
+          :on-focus (fn [e] (let [v (.-value (.-target e))]
+                              (when (= v "device-uuid here")
+                                (set! (.-value (.-target e)) ""))))
+          :placeholder "device-uuid here"}]
+        [:input.form-input.my-2.py-1.w-32
+         {:on-change (fn [e] (swap! *keys-state assoc :remove-public-key-key-name (util/evalue e)))
+          :on-focus (fn [e] (let [v (.-value (.-target e))]
+                              (when (= v "key-name here")
+                                (set! (.-value (.-target e)) ""))))
+          :placeholder "key-name here"}]
+        (shui/button
+         {:size :sm
+          :on-click (fn [_]
+                      (when-let [token (state/get-auth-id-token)]
+                        (when-let [device-uuid (not-empty (:sync-private-key-device-uuid keys-state))]
+                          (state/<invoke-db-worker :thread-api/rtc-sync-current-graph-encrypted-aes-key
+                                                   token [(parse-uuid device-uuid)]))))}
+         "Sync CurrentGraph EncryptedAesKey")
+        [:input.form-input.my-2.py-1.w-32
+         {:on-change (fn [e] (swap! *keys-state assoc :sync-private-key-device-uuid (util/evalue e)))
+          :on-focus (fn [e] (let [v (.-value (.-target e))]
+                              (when (= v "device-uuid here")
+                                (set! (.-value (.-target e)) ""))))
+          :placeholder "device-uuid here"}]])]))

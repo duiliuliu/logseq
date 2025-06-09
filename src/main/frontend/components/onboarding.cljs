@@ -1,13 +1,7 @@
 (ns frontend.components.onboarding
   (:require [frontend.context.i18n :refer [t]]
-            [rum.core :as rum]
             [frontend.ui :as ui]
-            [frontend.state :as state]
-            [frontend.components.onboarding.setups :as setups]))
-
-(rum/defc intro
-  [onboarding-and-home?]
-  (setups/picker onboarding-and-home?))
+            [frontend.state :as state]))
 
 (defn help
   []
@@ -34,7 +28,7 @@
           {:title (t :help/title-development)
            :children [[(t :help/roadmap) "https://trello.com/b/8txSM12G/roadmap"]
                       [(t :help/bug) "https://github.com/logseq/logseq/issues/new?labels=from:in-app&template=bug_report.yaml"]
-                      [(t :help/feature) "https://discuss.logseq.com/c/feature-requests/"]
+                      [(t :help/feature) "https://discuss.logseq.com/c/feedback/feature-requests/"]
                       [(t :help/changelog) "https://docs.logseq.com/#/page/changelog"]]}
 
           {:title (t :help/title-about)

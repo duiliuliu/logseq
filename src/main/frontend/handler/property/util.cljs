@@ -2,51 +2,37 @@
   "Utility fns for properties that are for both file and db graphs.
   Some fns like lookup and get-property were written to easily be backwards
   compatible with file graphs"
-  (:require [frontend.config :as config]
+  (:require [frontend.db.conn :as conn]
             [frontend.state :as state]
-            [logseq.graph-parser.util :as gp-util]
-            [frontend.db :as db]
-            [frontend.util :as util]))
+            [logseq.db.common.property-util :as db-property-util]))
 
 (defn lookup
-  "Get the value of coll's (a map) `key`. For file and db graphs"
-  [coll key]
-  (let [repo (state/get-current-repo)
-        property-name (if (keyword? key)
-                        (name key)
-                        key)]
-    (if (config/db-based-graph? repo)
-      (when-let [property (db/entity repo [:block/name (gp-util/page-name-sanity-lc property-name)])]
-        (get coll (:block/uuid property)))
-      (get coll key))))
-
-(defn get-property
-  "Get the value of block's property `key`"
+  "Get the property value by a built-in property's db-ident from block. For file and db graphs"
   [block key]
-  (let [block (or (db/entity (:db/id block)) block)]
-    (when-let [properties (:block/properties block)]
-      (lookup properties key))))
+  (let [repo (state/get-current-repo)]
+    (db-property-util/lookup repo block key)))
 
-(defn get-page-uuid
-  "Get a user property's uuid given its unsanitized name"
-  ;; Get a page's uuid given its unsanitized name
-  ([property-name] (get-page-uuid (state/get-current-repo) property-name))
-  ([repo property-name]
-   (:block/uuid (db/entity repo [:block/name (gp-util/page-name-sanity-lc (name property-name))]))))
+(defn get-block-property-value
+  "Get the value of a built-in block's property by its db-ident"
+  [block db-ident]
+  (let [repo (state/get-current-repo)
+        db (conn/get-db repo)]
+    (db-property-util/get-block-property-value repo db block db-ident)))
 
 (defn get-pid
-  "Get a property's id (name or uuid) given its name. For file and db graphs"
-  [property-name]
+  "Get a built-in property's id (db-ident or name) given its db-ident. For file and db graphs"
+  [db-ident]
   (let [repo (state/get-current-repo)]
-    (if (config/db-based-graph? repo)
-      (:block/uuid (db/entity [:block/name (util/page-name-sanity-lc (name property-name))]))
-      property-name)))
+    (db-property-util/get-pid repo db-ident)))
 
 (defn block->shape [block]
-  (get-property block :logseq.tldraw.shape))
+  (get-block-property-value block :logseq.property.tldraw/shape))
 
 (defn page-block->tldr-page [block]
-  (get-property block :logseq.tldraw.page))
+  (get-block-property-value block :logseq.property.tldraw/page))
 
-(defn shape-block? [block]
-  (= :whiteboard-shape (get-property block :ls-type)))
+(defn shape-block?
+  [block]
+  (let [repo (state/get-current-repo)
+        db (conn/get-db repo)]
+    (db-property-util/shape-block? repo db block)))

@@ -1,10 +1,8 @@
 (ns frontend.mobile.util
-  (:require ["@capacitor/core" :refer [Capacitor registerPlugin ^js Plugins]]
+  (:require ["@capacitor/core" :refer [Capacitor registerPlugin]]
             ["@capacitor/splash-screen" :refer [SplashScreen]]
-            ["@logseq/capacitor-file-sync" :refer [FileSync]]
             [clojure.string :as string]
-            [promesa.core :as p]
-            [goog.object :as gobj]))
+            [promesa.core :as p]))
 
 (defn platform []
   (.getPlatform Capacitor))
@@ -25,13 +23,7 @@
 
 (defonce folder-picker (registerPlugin "FolderPicker"))
 (when (native-ios?)
-  (defonce ios-utils (registerPlugin "Utils"))
-  (defonce ios-file-container (registerPlugin "FileContainer")))
-
-;; NOTE: both iOS and android share the same API
-(when (native-platform?)
-  (defonce file-sync FileSync)
-  (defonce fs-watcher (registerPlugin "FsWatcher")))
+  (defonce ios-utils (registerPlugin "Utils")))
 
 (defn hide-splash []
   (.hide SplashScreen))
@@ -44,6 +36,9 @@
           landscape? (> width height)
           [width height] (if landscape? [height width] [width height])]
       [(case [width height]
+         ;; The following list is from:
+         ;; - https://useyourloaf.com/blog/ipad-2024-screen-sizes/
+         ;; - https://useyourloaf.com/blog/iphone-15-screen-sizes/
          [320 568] "iPhoneSE4"
          [375 667] "iPhone8"
          [375 812] "iPhoneX"
@@ -61,6 +56,8 @@
          [834 1112] "iPadAir10.5"
          [834 1194] "iPadPro11"
          [1024 1366] "iPadPro12.9"
+         [1032 1376] "iPadPro13(M4)"
+         [834 1210]  "iPadPro11(M4)"
          "Not a known Apple device!")
        landscape?])))
 
@@ -94,14 +91,10 @@
   [path]
   (string/includes? path "/iCloud~com~logseq~logseq/"))
 
-(defn is-iCloud-container-path?
-  "Check whether `path' is iCloud container path on iOS"
-  [path]
-  (re-matches #"/iCloud~com~logseq~logseq/Documents/?$" path))
-
-(defn app-active?
-  "Whether the app is active. This function returns a promise."
-  []
-  (let [app ^js (gobj/get Plugins "App")]
-    (p/let [state (.getState app)]
-      (gobj/get state "isActive"))))
+(comment
+  (defn app-active?
+    "Whether the app is active. This function returns a promise."
+    []
+    (let [app ^js (gobj/get Plugins "App")]
+      (p/let [state (.getState app)]
+        (gobj/get state "isActive")))))

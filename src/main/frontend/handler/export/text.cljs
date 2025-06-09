@@ -1,17 +1,18 @@
 (ns frontend.handler.export.text
   "export blocks/pages as text"
-  (:refer-clojure :exclude [map filter mapcat concat remove newline])
   (:require [clojure.string :as string]
+            [frontend.config :as config]
             [frontend.db :as db]
             [frontend.extensions.zip :as zip]
+            [frontend.format.mldoc :as mldoc]
             [frontend.handler.export.common :as common :refer
              [*state* indent newline* raw-text simple-ast-malli-schema
               simple-asts->string space]]
-            [logseq.graph-parser.schema.mldoc :as mldoc-schema]
-            [frontend.state :as state]
             [frontend.util :as util :refer [concatv mapcatv removev]]
             [goog.dom :as gdom]
-            [frontend.format.mldoc :as mldoc]
+            [logseq.common.path :as path]
+            [logseq.db :as ldb]
+            [logseq.graph-parser.schema.mldoc :as mldoc-schema]
             [malli.core :as m]
             [promesa.core :as p]))
 
@@ -65,10 +66,10 @@
                        "[X]" "[ ]")
                      ""))
         current-level (get *state* :current-level 1)
-        indent (when (> current-level 1)
-                 (indent (dec current-level) 0))
+        indent' (when (> current-level 1)
+                  (indent (dec current-level) 0))
         items* (block-list items :in-list? true)]
-    (concatv [indent number* checkbox* space]
+    (concatv [indent' number* checkbox* space]
              content*
              [(newline* 1)]
              items*
@@ -86,10 +87,10 @@
   [properties]
   (when-not (get-in *state* [:export-options :remove-properties?])
     (let [level (dec (get *state* :current-level 1))
-          indent (indent-with-2-spaces level)]
+          indent' (indent-with-2-spaces level)]
       (reduce
        (fn [r [k v]]
-         (conj r indent (raw-text k "::") space (raw-text v) (newline* 1)))
+         (conj r indent' (raw-text k "::") space (raw-text v) (newline* 1)))
        [] properties))))
 
 (defn- block-example
@@ -103,14 +104,35 @@
         (newline* 1)])
      l)))
 
+(defn- remove-max-prefix-spaces
+  [lines]
+  (let [common-prefix-spaces
+        (reduce
+         (fn [r line]
+           (if (string/blank? line)
+             r
+             (let [leading-spaces (re-find #"^\s+" line)]
+               (if (nil? r)
+                 leading-spaces
+                 (if (string/starts-with? r leading-spaces)
+                   leading-spaces
+                   r)))))
+         nil
+         lines)
+        pattern (re-pattern (str "^" common-prefix-spaces))]
+    (mapv (fn [line] (string/replace-first line pattern "")) lines)))
+
 (defn- block-src
   [{:keys [lines language]}]
-  (let [level (dec (get *state* :current-level 1))]
+  (let [level (dec (get *state* :current-level 1))
+        lines* (if (= "no-indent" (get-in *state* [:export-options :indent-style]))
+                 (remove-max-prefix-spaces lines)
+                 lines)]
     (concatv
      [(indent-with-2-spaces level) (raw-text "```")]
      (when language [(raw-text language)])
      [(newline* 1)]
-     (mapv raw-text lines)
+     (mapv raw-text lines*)
      [(indent-with-2-spaces level) (raw-text "```") (newline* 1)])))
 
 (defn- block-quote
@@ -313,7 +335,9 @@
 
 (defn- inline-break-line
   []
-  [(raw-text "  \n")
+  [(if (= "no-indent" (get-in *state* [:export-options :indent-style]))
+     (raw-text "\n")
+     (raw-text "  \n"))
    (when (:indent-after-break-line? *state*)
      (let [current-level (get *state* :current-level 1)]
        (when (> current-level 1)
@@ -336,6 +360,10 @@
             (when (and origin-ast newline-after-block? (not current-block-is-first-heading-block?))
               [(newline* 2)])
             (mapcatv inline-ast->simple-ast ast-content)
+            (let [last-element (last ast-content)
+                  [last-element-type] last-element]
+              (when (and newline-after-block? (= "Break_Line" last-element-type))
+                (inline-break-line)))
             [(newline* 1)]))
          "Paragraph_line"
          (assert false "Paragraph_line is mldoc internal ast")
@@ -465,7 +493,10 @@
                                         (update :map-fns-on-inline-ast conj common/remove-page-ref-brackets)
 
                                         (get-in *state* [:export-options :remove-tags?])
-                                        (update :mapcat-fns-on-inline-ast conj common/remove-tags))
+                                        (update :mapcat-fns-on-inline-ast conj common/remove-tags)
+
+                                        (= "no-indent" (get-in *state* [:export-options :indent-style]))
+                                        (update :fns-on-inline-coll conj common/remove-prefix-spaces-in-Plain))
             ast*** (if-not (empty? config-for-walk-block-ast)
                      (mapv (partial common/walk-block-ast config-for-walk-block-ast) ast**)
                      ast**)
@@ -477,40 +508,53 @@
   :indent-style \"dashes\" | \"spaces\" | \"no-indent\"
   :remove-options [:emphasis :page-ref :tag :property]
   :other-options {:keep-only-level<=N int :newline-after-block bool}"
-  [repo root-block-uuids-or-page-name options]
-  {:pre [(or (coll? root-block-uuids-or-page-name)
-             (string? root-block-uuids-or-page-name))]}
+  [repo root-block-uuids-or-page-uuid options]
+  {:pre [(or (coll? root-block-uuids-or-page-uuid)
+             (uuid? root-block-uuids-or-page-uuid))]}
   (util/profile
    :export-blocks-as-markdown
-   (let [content
-         (if (string? root-block-uuids-or-page-name)
-           ;; page
-           (common/get-page-content root-block-uuids-or-page-name)
-           (common/root-block-uuids->content repo root-block-uuids-or-page-name))
-         first-block (db/entity [:block/uuid (first root-block-uuids-or-page-name)])
-         format (or (:block/format first-block) (state/get-preferred-format))]
-     (export-helper content format options))))
+   (try
+     (let [content
+           (cond
+             ;; page
+             (and (= 1 (count root-block-uuids-or-page-uuid))
+                  (ldb/page? (db/entity [:block/uuid (first root-block-uuids-or-page-uuid)])))
+             (common/get-page-content (first root-block-uuids-or-page-uuid))
+             (and (coll? root-block-uuids-or-page-uuid) (every? #(ldb/page? (db/entity [:block/uuid %])) root-block-uuids-or-page-uuid))
+             (->> (mapv (fn [id] (:block/title (db/entity [:block/uuid id]))) root-block-uuids-or-page-uuid)
+                  (string/join "\n"))
+             :else
+             (common/root-block-uuids->content repo root-block-uuids-or-page-uuid))
+           first-block (and (coll? root-block-uuids-or-page-uuid)
+                            (db/entity [:block/uuid (first root-block-uuids-or-page-uuid)]))
+           format (get first-block :block/format :markdown)]
+       (export-helper content format options))
+     (catch :default e
+       (js/console.error e)))))
 
 (defn export-files-as-markdown
   "options see also `export-blocks-as-markdown`"
   [files options]
   (mapv
-   (fn [{:keys [path content names format]}]
-     (when (first names)
-       (util/profile (print-str :export-files-as-markdown path)
-                     [path (export-helper content format options)])))
+   (fn [{:keys [path title content]}]
+     (util/profile (print-str :export-files-as-markdown title)
+                   [(or path title) (export-helper content :markdown options)]))
    files))
 
 (defn export-repo-as-markdown!
   "TODO: indent-style and remove-options"
   [repo]
-  (when-let [files (util/profile :get-file-content (common/get-file-contents-with-suffix repo))]
-    (let [files (export-files-as-markdown files nil)
-          zip-file-name (str repo "_markdown_" (quot (util/time-ms) 1000))]
-      (p/let [zipfile (zip/make-zip zip-file-name files repo)]
-        (when-let [anchor (gdom/getElement "export-as-markdown")]
-          (.setAttribute anchor "href" (js/window.URL.createObjectURL zipfile))
-          (.setAttribute anchor "download" (.-name zipfile))
-          (.click anchor))))))
+  (p/let [files* (util/profile :get-file-content (common/<get-file-contents repo "md"))]
+    (when (seq files*)
+      (let [files (export-files-as-markdown files* nil)
+            repo' (if (config/db-based-graph? repo)
+                    (string/replace repo config/db-version-prefix "")
+                    (path/basename repo))
+            zip-file-name (str repo' "_markdown_" (quot (util/time-ms) 1000))]
+        (p/let [zipfile (zip/make-zip zip-file-name files repo')]
+          (when-let [anchor (gdom/getElement "export-as-markdown")]
+            (.setAttribute anchor "href" (js/window.URL.createObjectURL zipfile))
+            (.setAttribute anchor "download" (.-name zipfile))
+            (.click anchor)))))))
 
 ;;; export fns (ends)

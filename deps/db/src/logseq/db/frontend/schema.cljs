@@ -1,180 +1,82 @@
 (ns logseq.db.frontend.schema
-  "Main datascript schemas for the Logseq app"
-  (:require [clojure.set :as set]))
+  "Schema related fns for DB and file graphs"
+  (:require [clojure.set :as set]
+            [clojure.string :as string]
+            [logseq.db.file-based.schema :as file-schema]))
 
-(defonce version 2)
-(defonce ast-version 1)
-;; A page is a special block, a page can corresponds to multiple files with the same ":block/name".
-(def ^:large-vars/data-var schema
-  {:schema/version  {}
-   :ast/version     {}
-   :db/type         {}
-   :db/ident        {:db/unique :db.unique/identity}
+(def schema-version? (every-pred map? :major))
 
-   :recent/pages {}
+(def major-schema-version-string-schema
+  [:and :string
+   [:fn
+    {:error/message "should be a major schema-version"}
+    (fn [s] (some? (parse-long s)))]])
 
-   ;; :block/type is a string type or multiple types of the current block
-   ;; "whiteboard" for whiteboards
-   ;; "macros" for macro
-   ;; "property" for property blocks
-   ;; "class" for structured page
-   :block/type {:db/index true
-                :db/cardinality :db.cardinality/many}
-   :block/schema {}
-   :block/uuid {:db/unique :db.unique/identity}
-   :block/parent {:db/valueType :db.type/ref
-                  :db/index true}
-   :block/left   {:db/valueType :db.type/ref
-                  :db/index true}
-   :block/collapsed? {:db/index true}
-   :block/collapsed-properties {:db/valueType :db.type/ref
-                                :db/cardinality :db.cardinality/many}
+(defn parse-schema-version
+  "Return schema-version({:major <num> :minor <num>}).
+  supported input: 10, \"10.1\", [10 1]"
+  [string-or-compatible-number]
+  (cond
+    (schema-version? string-or-compatible-number) string-or-compatible-number
+    (and (sequential? string-or-compatible-number)
+         (first string-or-compatible-number))
+    {:major (first string-or-compatible-number)
+     :minor (second string-or-compatible-number)}
 
-   ;; :markdown, :org
-   :block/format {}
+    (int? string-or-compatible-number) {:major string-or-compatible-number :minor nil}
+    (string? string-or-compatible-number)
+    (let [[major minor] (map parse-long (string/split string-or-compatible-number #"\."))]
+      (assert (some? major))
+      {:major major :minor minor})
+    :else
+    (throw (ex-info (str "Bad schema version: " string-or-compatible-number) {:data string-or-compatible-number}))))
 
-   ;; belongs to which page
-   :block/page {:db/valueType :db.type/ref
-                :db/index true}
-   ;; reference blocks
-   :block/refs {:db/valueType :db.type/ref
-                :db/cardinality :db.cardinality/many}
-   ;; referenced pages inherited from the parents
-   :block/path-refs {:db/valueType   :db.type/ref
-                     :db/cardinality :db.cardinality/many}
+(defn compare-schema-version
+  [x y]
+  (apply compare
+         (map (juxt :major :minor)
+              [(parse-schema-version x) (parse-schema-version y)])))
 
-   ;; tags are structured classes
-   :block/tags {:db/valueType :db.type/ref
-                :db/cardinality :db.cardinality/many}
+(def version (parse-schema-version "64.9"))
 
-   ;; which block this block links to, used for tag, embeds
-   :block/link {:db/valueType :db.type/ref
-                :db/index true}
+(defn major-version
+  "Return a number.
+  Compatible with current schema-version number.
+  schema-version-old: 10, a number
+  schema-version-new: \"12.34\", string, <major-num>.<minor-num>"
+  [schema-version]
+  (if (schema-version? schema-version)
+    (:major schema-version)
+    (:major (parse-schema-version schema-version))))
 
-   ;; for pages
-   :block/alias {:db/valueType :db.type/ref
-                 :db/cardinality :db.cardinality/many}
+(defn schema-version->string
+  [schema-version]
+  (cond
+    (string? schema-version) schema-version
+    (int? schema-version) (str schema-version)
+    (schema-version? schema-version)
+    (if-let [minor (:minor schema-version)]
+      (str (:major schema-version) "." minor)
+      (str (:major schema-version)))
+    :else (throw (ex-info "Not a schema-version" {:data schema-version}))))
 
-   ;; full-text for current block
-   :block/content {}
-
-   ;; todo keywords, e.g. "TODO", "DOING", "DONE"
-   :block/marker {}
-
-   ;; "A", "B", "C"
-   :block/priority {}
-
-   ;; map, key -> set of refs in property value or full text if none are found
-   :block/properties {}
-   ;; vector
-   :block/properties-order {}
-   ;; map, key -> original property value's content
-   :block/properties-text-values {}
-
-   ;; non-indexed metadata
-   :block/metadata {}
-
-   ;; first block that's not a heading or unordered list
-   :block/pre-block? {}
-
-   ;; scheduled day
-   :block/scheduled {}
-
-   ;; deadline day
-   :block/deadline {}
-
-   ;; whether blocks is a repeated block (usually a task)
-   :block/repeated? {}
-
-   :block/created-at {}
-   :block/updated-at {}
-
-   ;; page additional attributes
-   ;; page's name, lowercase
-   :block/name {:db/unique :db.unique/identity}
-
-   ;; page's original name
-   :block/original-name {:db/unique :db.unique/identity}
-   ;; whether page's is a journal
-   :block/journal? {}
-   :block/journal-day {}
-   ;; page's namespace
-   :block/namespace {:db/valueType :db.type/ref}
-   ;; macros in block
-   :block/macros {:db/valueType :db.type/ref
-                  :db/cardinality :db.cardinality/many}
-   ;; block's file
-   :block/file {:db/valueType :db.type/ref}
-
-   ;; latest tx that affected the block
-   :block/tx-id {}
-
-   ;; file
-   :file/path {:db/unique :db.unique/identity}
-   ;; only store the content of logseq's files
-   :file/content {}
-   :file/handle {}
-   ;; :file/created-at {}
-   ;; :file/last-modified-at {}
-   ;; :file/size {}
-   })
-
-(def schema-for-db-based-graph
+(def schema
+  "Schema for DB graphs. :block/tags are classes in this schema"
   (merge
-   (dissoc schema
-           :block/properties-text-values :block/pre-block? :recent/pages :file/handle :block/file
-           :block/properties-order)
-   {:file/last-modified-at {}}))
+   (apply dissoc file-schema/schema file-schema/file-only-attributes)
+   {:block/name {:db/index true}        ; remove db/unique for :block/name
+    ;; closed value
+    :block/closed-value-property {:db/valueType :db.type/ref
+                                  :db/cardinality :db.cardinality/many}}))
 
+;; If only block/title changes
 (def retract-attributes
-  #{
-    :block/refs
-    :block/tags
-    :block/alias
-    :block/marker
-    :block/priority
-    :block/scheduled
-    :block/deadline
-    :block/repeated?
-    :block/pre-block?
-    :block/properties
-    :block/properties-order
-    :block/properties-text-values
-    :block/macros
-    :block/invalid-properties
-    :block/warning
-    }
-  )
-
-;; If only block/content changes
-(def db-version-retract-attributes
-  #{:block/tags
-    :block/refs
-    :block/marker
-    :block/priority
-    :block/scheduled
-    :block/deadline
-    :block/repeated?
-    :block/macros
+  "Retract attributes for DB graphs"
+  #{:block/refs
     :block/warning})
 
-
-;;; use `(map [:db.fn/retractAttribute <id> <attr>] retract-page-attributes)`
-;;; to remove attrs to make the page as it's just created and no file attached to it
-(def retract-page-attributes
-  #{:block/created-at
-    :block/updated-at
-    :block/file
-    :block/format
-    :block/content
-    :block/properties
-    :block/properties-order
-    :block/properties-text-values
-    :block/invalid-properties
-    :block/alias
-    :block/tags})
-
-
+;; DB graph helpers
+;; ================
 (def ref-type-attributes
   (into #{}
         (keep (fn [[attr-name attr-body-map]]
@@ -196,7 +98,7 @@
   (set/difference ref-type-attributes card-many-attributes))
 
 (def db-non-ref-attributes
-  (->> schema-for-db-based-graph
+  (->> schema
        (keep (fn [[k v]]
                (when (not (:db/valueType v))
                  k)))

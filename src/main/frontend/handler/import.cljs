@@ -1,86 +1,23 @@
 (ns frontend.handler.import
   "Fns related to import from external services"
-  (:require [clojure.edn :as edn]
-            [clojure.walk :as walk]
-            [frontend.external :as external]
-            [frontend.handler.file :as file-handler]
-            [frontend.handler.repo :as repo-handler]
-            [frontend.state :as state]
-            [frontend.date :as date]
-            [frontend.config :as config]
+  (:require [cljs.core.async.interop :refer [p->c]]
+            [clojure.core.async :as async]
+            [clojure.edn :as edn]
             [clojure.string :as string]
+            [clojure.walk :as walk]
             [frontend.db :as db]
-            [frontend.format.mldoc :as mldoc]
+            [frontend.db.async :as db-async]
             [frontend.format.block :as block]
-            [logseq.graph-parser.mldoc :as gp-mldoc]
-            [logseq.graph-parser.util :as gp-util]
-            [logseq.graph-parser.whiteboard :as gp-whiteboard]
-            [logseq.graph-parser.date-time-util :as date-time-util]
-            [frontend.handler.page :as page-handler]
+            [frontend.format.mldoc :as mldoc]
             [frontend.handler.editor :as editor]
             [frontend.handler.notification :as notification]
+            [frontend.handler.page :as page-handler]
+            [frontend.state :as state]
             [frontend.util :as util]
-            [clojure.core.async :as async]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
+            [logseq.graph-parser.whiteboard :as gp-whiteboard]
             [medley.core :as medley]
-            [frontend.persist-db :as persist-db]
             [promesa.core :as p]))
-
-(defn index-files!
-  "Create file structure, then parse into DB (client only)"
-  [repo files finish-handler]
-  (let [titles (->> files
-                    (map :title)
-                    (remove nil?))
-        files (map (fn [file]
-                     (let [title (:title file)
-                           journal? (date/valid-journal-title? title)]
-                       (when-let [text (:text file)]
-                         (let [title (or
-                                      (when journal?
-                                        (date/journal-title->default title))
-                                      (string/replace title "/" "-"))
-                               title (-> (gp-util/page-name-sanity title)
-                                         (string/replace "\n" " "))
-                               path (str (if journal?
-                                           (config/get-journals-directory)
-                                           (config/get-pages-directory))
-                                         "/"
-                                         title
-                                         ".md")]
-                           {:file/path path
-                            :file/content text}))))
-                files)
-        files (remove nil? files)]
-    (repo-handler/parse-files-and-load-to-db! repo files nil)
-    (let [files (->> (map (fn [{:file/keys [path content]}] (when path [path content])) files)
-                     (remove nil?))]
-      (file-handler/alter-files repo files {:add-history? false
-                                            :update-db? false
-                                            :update-status? false
-                                            :finish-handler finish-handler}))
-    (let [journal-pages-tx (let [titles (filter date/normalize-journal-title titles)]
-                             (map
-                               (fn [title]
-                                 (let [day (date/journal-title->int title)
-                                       journal-title (date-time-util/int->journal-title day (state/get-date-formatter))]
-                                   (when journal-title
-                                     (let [page-name (util/page-name-sanity-lc journal-title)]
-                                       {:block/name page-name
-                                        :block/journal? true
-                                        :block/journal-day day}))))
-                               titles))]
-      (when (seq journal-pages-tx)
-        (db/transact! repo journal-pages-tx)))))
-
-;; TODO: replace files with page blocks transaction
-(defn import-from-roam-json!
-  [data finished-ok-handler]
-  (when-let [repo (state/get-current-repo)]
-    (let [files (external/to-markdown-files :roam data {})]
-      (index-files! repo files
-                    (fn []
-                      (finished-ok-handler))))))
-
 
 ;;; import OPML files
 (defn import-from-opml!
@@ -95,23 +32,24 @@
           parsed-blocks (->>
                          (block/extract-blocks parsed-blocks "" :markdown {:page-name page-name})
                          (mapv editor/wrap-parse-block))]
-      (when (not (db/page-exists? page-name))
-        (page-handler/create! page-name {:redirect? false}))
-      (let [page-block (db/entity [:block/name (util/page-name-sanity-lc page-name)])
-            children (:block/_parent page-block)
-            blocks (db/sort-by-left children page-block)
-            last-block (last blocks)
-            snd-last-block (last (butlast blocks))
-            [target-block sibling?] (if (and last-block (seq (:block/content last-block)))
-                                      [last-block true]
-                                      (if snd-last-block
-                                        [snd-last-block true]
-                                        [page-block false]))]
-        (editor/paste-blocks
-         parsed-blocks
-         {:target-block target-block
-          :sibling? sibling?})
-        (finished-ok-handler [page-name])))))
+      (p/do!
+       (when (not (db/page-exists? page-name))
+         (page-handler/<create! page-name {:redirect? false}))
+       (let [page-block (db/get-page page-name)
+             children (:block/_parent page-block)
+             blocks (db/sort-by-order children)
+             last-block (last blocks)
+             snd-last-block (last (butlast blocks))
+             [target-block sibling?] (if (and last-block (seq (:block/title last-block)))
+                                       [last-block true]
+                                       (if snd-last-block
+                                         [snd-last-block true]
+                                         [page-block false]))]
+         (editor/paste-blocks
+          parsed-blocks
+          {:target-block target-block
+           :sibling? sibling?})
+         (finished-ok-handler [page-name]))))))
 
 (defn create-page-with-exported-tree!
   "Create page from the per page object generated in `export-repo-as-edn-v2!`
@@ -127,38 +65,39 @@
         has-children? (seq children)
         page-format (or (some-> tree (:children) (first) (:format)) :markdown)
         whiteboard? (= type "whiteboard")]
-    (try (page-handler/create! title {:redirect?           false
-                                      :format              page-format
-                                      :uuid                uuid
-                                      :create-first-block? false
-                                      :properties          properties
-                                      :whiteboard?         whiteboard?})
-         (catch :default e
-           (js/console.error e)
-           (prn {:tree tree})
-           (notification/show! (str "Error happens when creating page " title ":\n"
-                                    e
-                                    "\nSkipped and continue the remaining import.") :error)))
-    (when has-children?
-      (let [page-name (util/page-name-sanity-lc title)
-            page-block (db/entity [:block/name page-name])]
+    (p/do!
+     (try (page-handler/<create! title {:redirect?           false
+                                        :format              page-format
+                                        :uuid                uuid
+                                        :properties          properties
+                                        :whiteboard?         whiteboard?})
+          (catch :default e
+            (js/console.error e)
+            (prn {:tree tree})
+            (notification/show! (str "Error happens when creating page " title ":\n"
+                                     e
+                                     "\nSkipped and continue the remaining import.") :error)))
+     (when has-children?
+       (let [page-name (util/page-name-sanity-lc title)
+             page-block (db/get-page page-name)]
         ;; Missing support for per block format (or deprecated?)
-        (try (if whiteboard?
-               (let [blocks (->> children
-                                 (map (partial medley/map-keys (fn [k] (keyword "block" k))))
-                                 (map gp-whiteboard/migrate-shape-block)
-                                 (map #(merge % (gp-whiteboard/with-whiteboard-block-props % page-name))))]
-                 (db/transact! blocks))
-               (editor/insert-block-tree children page-format
-                                         {:target-block page-block
-                                          :sibling?     false
-                                          :keep-uuid?   true}))
-             (catch :default e
-               (js/console.error e)
-               (prn {:tree tree})
-               (notification/show! (str "Error happens when creating block content of page " title "\n"
-                                        e
-                                        "\nSkipped and continue the remaining import.") :error))))))
+         (try (if whiteboard?
+               ;; only works for file graph :block/properties
+                (let [blocks (->> children
+                                  (map (partial medley/map-keys (fn [k] (keyword "block" k))))
+                                  (map gp-whiteboard/migrate-shape-block)
+                                  (map #(merge % (gp-whiteboard/with-whiteboard-block-props % [:block/uuid uuid]))))]
+                  (db/transact! blocks))
+                (editor/insert-block-tree children page-format
+                                          {:target-block page-block
+                                           :sibling?     false
+                                           :keep-uuid?   true}))
+              (catch :default e
+                (js/console.error e)
+                (prn {:tree tree})
+                (notification/show! (str "Error happens when creating block content of page " title "\n"
+                                         e
+                                         "\nSkipped and continue the remaining import.") :error)))))))
   title)
 
 (defn- pre-transact-uuids!
@@ -177,7 +116,7 @@
   (let [imported-chan (async/promise-chan)]
     (try
       (let [blocks (->> (:blocks data)
-                        (mapv tree-translator-fn )
+                        (mapv tree-translator-fn)
                         (sort-by :title)
                         (medley/indexed))
             job-chan (async/to-chan! blocks)]
@@ -191,8 +130,8 @@
               (async/<! (async/timeout 10))
               (create-page-with-exported-tree! block)
               (recur))
-            (do
-              (editor/set-blocks-id! (db/get-all-referenced-blocks-uuid))
+            (let [result (async/<! (p->c (db-async/<get-all-referenced-blocks-uuid (state/get-current-repo))))]
+              (editor/set-blocks-id! result)
               (async/offer! imported-chan true)))))
 
       (catch :default e
@@ -220,31 +159,13 @@
                            form))]
      (walk/postwalk tree-trans-fn tree-vec))))
 
-(defn import-from-sqlite-db!
-  [buffer bare-graph-name finished-ok-handler]
-  (let [graph (str config/db-version-prefix bare-graph-name)]
-    (-> (p/let [_ (persist-db/<import-db graph buffer)]
-          (state/add-repo! {:url graph})
-          (repo-handler/restore-and-setup-repo! graph))
-        (p/then
-         (fn [_result]
-           (state/set-current-repo! graph)
-           (persist-db/<export-db graph {})
-           (finished-ok-handler)))
-        (p/catch
-         (fn [e]
-           (js/console.error e)
-           (notification/show!
-            (str (.-message e))
-            :error))))))
-
 (defn import-from-edn!
   [raw finished-ok-handler]
   (try
     (let [data (edn/read-string raw)]
-     (async/go
-       (async/<! (import-from-tree! data tree-vec-translate-edn))
-       (finished-ok-handler nil)))
+      (async/go
+        (async/<! (import-from-tree! data tree-vec-translate-edn))
+        (finished-ok-handler nil)))
     (catch :default e
       (js/console.error e)
       (notification/show!

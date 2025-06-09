@@ -7,7 +7,8 @@
             [lambdaisland.glogi :as log]
             [frontend.handler.notification :as notification]
             [goog.string :as gstring]
-            [reitit.frontend.easy :as rfe]))
+            [reitit.frontend.easy :as rfe]
+            [logseq.common.config :as common-config]))
 
 (defn- humanize-more
   "Make error maps from me/humanize more readable for users. Doesn't try to handle
@@ -93,11 +94,12 @@ nested keys or positional errors e.g. tuples"
                (catch :default _ ::failed-to-detect))
         warnings (cond->
                   {:editor/command-trigger
-                   "is no longer supported. Please use '/' and report bugs on it."}
+                   "is no longer supported. Please use '/' and report bugs on it."
+                   :arweave/gateway
+                   "is no longer supported."}
                    db-graph?
                    (merge
-                    {:preferred-format
-                     "is not used in DB graphs as there is only markdown mode."}))]
+                    common-config/file-only-config))]
     (cond
       (= body ::failed-to-detect)
       (log/info :msg "Skip deprecation check since config is not valid edn")

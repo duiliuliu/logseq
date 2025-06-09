@@ -1,152 +1,117 @@
 (ns frontend.handler.db-based.page
-  "Page handlers for DB graphs"
-  (:require [frontend.state :as state]
+  "DB graph only page util fns"
+  (:require [clojure.string :as string]
+            [datascript.impl.entity :as de]
             [frontend.db :as db]
-            [frontend.db.model :as model]
-            [frontend.db.conn :as conn]
-            [frontend.db.utils :as db-utils]
-            [frontend.util :as util]
-            [frontend.handler.ui :as ui-handler]
-            [frontend.handler.notification :as notification]
-            [frontend.handler.route :as route-handler]
-            [frontend.modules.outliner.core :as outliner-core]
-            [frontend.modules.outliner.tree :as outliner-tree]
+            [frontend.db.async :as db-async]
             [frontend.handler.common.page :as page-common-handler]
-            [datascript.core :as d]
-            [medley.core :as medley]
-            [clojure.string :as string]))
+            [frontend.handler.db-based.property :as db-property-handler]
+            [frontend.handler.editor :as editor-handler]
+            [frontend.handler.notification :as notification]
+            [frontend.state :as state]
+            [logseq.common.util :as common-util]
+            [logseq.common.util.page-ref :as page-ref]
+            [logseq.db]
+            [logseq.db.frontend.class :as db-class]
+            [logseq.db.frontend.content :as db-content]
+            [logseq.outliner.validate :as outliner-validate]
+            [logseq.shui.ui :as shui]
+            [promesa.core :as p]))
 
-(defn- replace-ref
-  "Replace from-page refs with to-page"
-  [from-page to-page]
-  (let [refs (:block/_refs from-page)
-        from-uuid (:block/uuid from-page)
-        to-uuid (:block/uuid to-page)
-        replace-ref (fn [content] (string/replace content (str from-uuid) (str to-uuid)))]
-    (when (seq refs)
-      (let [tx-data (mapcat
-                     (fn [{:block/keys [raw-content properties] :as ref}]
-                         ;; block content or properties
-                       (let [content' (replace-ref raw-content)
-                             content-tx (when (not= raw-content content')
-                                          {:db/id (:db/id ref)
-                                           :block/content content'})
-                             properties' (-> (medley/map-vals (fn [v]
-                                                                (cond
-                                                                  (and (coll? v) (uuid? (first v)))
-                                                                  (mapv (fn [id] (if (= id from-uuid) to-uuid id)) v)
+(defn- valid-tag?
+  "Returns a boolean indicating whether the new tag passes all valid checks.
+   When returning false, this fn also displays appropriate notifications to the user"
+  [repo block tag-entity]
+  (try
+    (outliner-validate/validate-unique-by-name-tag-and-block-type
+     (db/get-db repo)
+     (:block/title block)
+     (update block :block/tags (fnil conj #{}) tag-entity))
+    true
+    (catch :default e
+      (if (= :notification (:type (ex-data e)))
+        (let [payload (:payload (ex-data e))]
+          (notification/show! (:message payload) (:type payload))
+          false)
+        (throw e)))))
 
-                                                                  (and (uuid? v) (= v from-uuid))
-                                                                  to-uuid
+(defn add-tag [repo block-id tag-entity]
+  (p/do!
+   (editor-handler/save-current-block!)
+   ;; Check after save-current-block to get most up to date block content
+   (when (valid-tag? repo (db/entity repo [:block/uuid block-id]) tag-entity)
+     (db-property-handler/set-block-property! block-id :block/tags (:db/id tag-entity)))))
 
-                                                                  (and (coll? v) (string? (first v)))
-                                                                  (mapv replace-ref v)
+(defn convert-to-tag!
+  "Converts a Page to a Tag"
+  [page-entity]
+  (if (db/page-exists? (:block/title page-entity) #{:logseq.class/Tag})
+    (notification/show! (str "A tag with the name \"" (:block/title page-entity) "\" already exists.") :warning false)
+    (let [txs [(db-class/build-new-class (db/get-db)
+                                         {:db/id (:db/id page-entity)
+                                          :block/title (:block/title page-entity)
+                                          :block/created-at (:block/created-at page-entity)})
+               [:db/retract (:db/id page-entity) :block/tags :logseq.class/Page]]]
 
-                                                                  (string? v)
-                                                                  (replace-ref v)
+      (db/transact! (state/get-current-repo) txs {:outliner-op :save-block}))))
 
-                                                                  :else
-                                                                  v)) properties)
-                                             (util/remove-nils-non-nested))
-                             tx (merge
-                                 content-tx
-                                 (when (not= (seq properties) (seq properties'))
-                                   {:db/id (:db/id ref)
-                                    :block/properties properties'}))]
-                         (concat
-                          [[:db/add (:db/id ref) :block/refs (:db/id to-page)]
-                           [:db/retract (:db/id ref) :block/refs (:db/id from-page)]]
-                          (when tx [tx]))))
-                     refs)]
-        tx-data))))
+(defn convert-tag-to-page!
+  [page-entity]
+  (if (db/page-exists? (:block/title page-entity) #{:logseq.class/Page})
+    (notification/show! (str "A page with the name \"" (:block/title page-entity) "\" already exists.") :warning false)
+    (when-not (:logseq.property/built-in? page-entity)
+      (p/let [objects (db-async/<get-tag-objects (state/get-current-repo) (:db/id page-entity))]
+        (let [convert-fn
+              (fn convert-fn []
+                (let [page-txs [[:db/retract (:db/id page-entity) :db/ident]
+                                [:db/retract (:db/id page-entity) :block/tags :logseq.class/Tag]
+                                [:db/add (:db/id page-entity) :block/tags :logseq.class/Page]]
+                      obj-txs (mapcat (fn [obj]
+                                        (let [tags (map #(db/entity (state/get-current-repo) (:db/id %)) (:block/tags obj))]
+                                          [{:db/id (:db/id obj)
+                                            :block/title (db-content/replace-tag-refs-with-page-refs (:block/title obj) tags)}
+                                           [:db/retract (:db/id obj) :block/tags (:db/id page-entity)]]))
+                                      objects)
+                      txs (concat page-txs obj-txs)]
+                  (db/transact! (state/get-current-repo) txs {:outliner-op :save-block})))]
+          (-> (shui/dialog-confirm!
+               "Converting a tag to page also removes tags from any nodes that have that tag. Are you ok with that?"
+               {:id :convert-tag-to-page
+                :data-reminder :ok})
+              (p/then convert-fn)))))))
 
-(defn- based-merge-pages!
-  [from-page-name to-page-name persist-op? redirect?]
-  (when (and (db/page-exists? from-page-name)
-             (db/page-exists? to-page-name)
-             (not= from-page-name to-page-name))
-    (let [to-page (db/entity [:block/name to-page-name])
-          to-id (:db/id to-page)
-          from-page (db/entity [:block/name from-page-name])
-          from-id (:db/id from-page)
-          from-first-child (some->> (db/pull from-id)
-                                    (outliner-core/block)
-                                    (outliner-tree/-get-down)
-                                    (outliner-core/get-data))
-          to-last-direct-child-id (model/get-block-last-direct-child-id (db/get-db) to-id)
-          repo (state/get-current-repo)
-          conn (conn/get-db repo false)
-          datoms (d/datoms @conn :avet :block/page from-id)
-          block-eids (mapv :e datoms)
-          blocks (db-utils/pull-many repo '[:db/id :block/page :block/refs :block/path-refs :block/left :block/parent] block-eids)
-          blocks-tx-data (map (fn [block]
-                                (let [id (:db/id block)]
-                                  (cond->
-                                   {:db/id id
-                                    :block/page {:db/id to-id}}
+(defn <create-class!
+  "Creates a class page and provides class-specific error handling"
+  [title options]
+  (-> (page-common-handler/<create! title (assoc options :class? true))
+      (p/catch (fn [e]
+                 (when (= :notification (:type (ex-data e)))
+                   (notification/show! (get-in (ex-data e) [:payload :message])
+                                       (get-in (ex-data e) [:payload :type])))
+                 ;; Re-throw as we don't want to proceed with a nonexistent class
+                 (throw e)))))
 
-                                    (and from-first-child (= id (:db/id from-first-child)))
-                                    (assoc :block/left {:db/id (or to-last-direct-child-id to-id)})
-
-                                    (= (:block/parent block) {:db/id from-id})
-                                    (assoc :block/parent {:db/id to-id})))) blocks)
-          replace-ref-tx-data (replace-ref from-page to-page)
-          tx-data (concat blocks-tx-data replace-ref-tx-data)]
-      (db/transact! repo tx-data {:persist-op? persist-op?})
-      (page-common-handler/rename-update-namespace! from-page
-                                                    (util/get-page-original-name from-page)
-                                                    (util/get-page-original-name to-page)))
-
-    (page-common-handler/delete! from-page-name nil :redirect-to-home? false :persist-op? persist-op?)
-
-    (when redirect?
-      (route-handler/redirect! {:to          :page
-                                :push        false
-                                :path-params {:name to-page-name}}))))
-
-(defn rename!
-  ([old-name new-name]
-   (rename! old-name new-name true true))
-  ([old-name new-name redirect? persist-op?]
-   (let [repo (state/get-current-repo)
-         old-name      (string/trim old-name)
-         new-name      (string/trim new-name)
-         old-page-name (util/page-name-sanity-lc old-name)
-         page-e (db/entity [:block/name old-page-name])
-         new-page-name (util/page-name-sanity-lc new-name)
-         new-page-e (db/entity [:block/name new-page-name])
-         name-changed? (not= old-name new-name)]
-     (cond
-       (string/blank? new-name)
-       (do
-         (notification/show! "Please use a valid name, empty name is not allowed!" :error)
-         :invalid-empty-name)
-
-       (and page-e new-page-e
-            (or (contains? (:block/type page-e) "whiteboard")
-                (contains? (:block/type new-page-e) "whiteboard")))
-       (do
-         (notification/show! "Can't merge whiteboard pages" :error)
-         :merge-whiteboard-pages)
-
-       (and old-name new-name name-changed?)
-       (do
-         (cond
-          (= old-page-name new-page-name) ; case changed
-          (db/transact! repo
-                        [{:db/id (:db/id page-e)
-                          :block/original-name new-name}]
-                        {:persist-op? persist-op?})
-
-          (and (not= old-page-name new-page-name)
-               (db/entity [:block/name new-page-name])) ; merge page
-          (based-merge-pages! old-page-name new-page-name persist-op? redirect?)
-
-          :else                          ; rename
-          (page-common-handler/create! new-name
-                                       {:rename? true
-                                        :uuid (:block/uuid page-e)
-                                        :redirect? redirect?
-                                        :create-first-block? false
-                                        :persist-op? persist-op?}))
-         (ui-handler/re-render-root!))))))
+(defn tag-on-chosen-handler
+  [chosen chosen-result class? edit-content current-pos last-pattern]
+  (let [tag (string/trim chosen)
+        edit-block (state/get-edit-block)
+        create-opts {:redirect? false}]
+    (when (:block/uuid edit-block)
+      (p/let [result (when-not (de/entity? chosen-result) ; page not exists yet
+                       (if class?
+                         (<create-class! tag create-opts)
+                         (page-common-handler/<create! tag create-opts)))]
+        (when class?
+          (let [tag-entity (or (when (de/entity? chosen-result) chosen-result) result)
+                hash-idx (string/last-index-of (subs edit-content 0 current-pos) last-pattern)
+                add-tag-to-nearest-node? (= page-ref/right-brackets (common-util/safe-subs edit-content (- hash-idx 2) hash-idx))
+                nearest-node (some-> (editor-handler/get-nearest-page) string/trim)]
+            (if (and add-tag-to-nearest-node? (not (string/blank? nearest-node)))
+              (p/let [node-ent (db/get-case-page nearest-node)
+                      ;; Save because nearest node doesn't exist yet
+                      _ (when-not node-ent (editor-handler/save-current-block!))
+                      node-ent' (or node-ent (db/get-case-page nearest-node))
+                      _ (add-tag (state/get-current-repo) (:block/uuid node-ent') tag-entity)]
+                ;; Notify as action has been applied to a node off screen
+                (notification/show! (str "Added tag " (pr-str (:block/title tag-entity)) " to " (pr-str (:block/title node-ent')))))
+              (add-tag (state/get-current-repo) (:block/uuid edit-block) tag-entity))))))))

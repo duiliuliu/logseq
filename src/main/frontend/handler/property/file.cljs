@@ -4,10 +4,8 @@
    It's unclear what the difference is between this and frontend.handler.property. If no difference,
    we should merge them"
   (:require [frontend.config :as config]
-            [frontend.db :as db]
             [frontend.handler.file-based.property.util :as property-util]
             [frontend.handler.file-based.property :as file-property-handler]
-            [frontend.state :as state]
             [clojure.string :as string]))
 
 ;; Why need these XXX-when-file-based fns?
@@ -46,13 +44,11 @@
 
 (def property-key-exist?-when-file-based property-util/property-key-exist?)
 (def goto-properties-end-when-file-based property-util/goto-properties-end)
-(def front-matter?-when-file-based property-util/front-matter?)
 
 (defn properties-hidden?
   [properties]
   (and (seq properties)
-       (let [ks (if (config/db-based-graph? (state/get-current-repo))
-                  (map #(:block/name (db/entity [:block/uuid %])) (keys properties))
-                  (map (comp keyword string/lower-case name) (keys properties)))
+       (let [ks (map (comp keyword string/lower-case name)
+                     (keys properties))
              hidden-properties-set (file-property-handler/hidden-properties)]
          (every? hidden-properties-set ks))))

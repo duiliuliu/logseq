@@ -1,16 +1,15 @@
 (ns frontend.mobile.deeplink
-  (:require
-   [clojure.string :as string]
-   [goog :refer [Uri]]
-   [frontend.config :as config]
-   [frontend.db.model :as db-model]
-   [frontend.handler.editor :as editor-handler]
-   [frontend.handler.notification :as notification]
-   [frontend.handler.route :as route-handler]
-   [frontend.mobile.intent :as intent]
-   [frontend.state :as state]
-   [frontend.util.text :as text-util]
-   [logseq.graph-parser.util :as gp-util]))
+  (:require [clojure.string :as string]
+            [frontend.config :as config]
+            [frontend.db.async :as db-async]
+            [frontend.handler.notification :as notification]
+            [frontend.handler.route :as route-handler]
+            [frontend.mobile.intent :as intent]
+            [frontend.state :as state]
+            [frontend.util.text :as text-util]
+            [goog :refer [Uri]]
+            [logseq.common.util :as common-util]
+            [promesa.core :as p]))
 
 (def *link-to-another-graph (atom false))
 
@@ -26,7 +25,7 @@
                                string/lower-case)
         current-graph-name (get-graph-name-fn current-repo-url)
         repos (->> (state/sub [:me :repos])
-                   (remove #(= (:url %) config/local-repo))
+                   (remove #(= (:url %) config/demo-repo))
                    (map :url))
         repo-names (map #(get-graph-name-fn %) repos)]
     (cond
@@ -53,13 +52,18 @@
              (fn []
                (cond
                  page-name
-                 (let [db-page-name (db-model/get-redirect-page-name page-name)]
-                   (editor-handler/insert-first-page-block-if-not-exists! db-page-name))
+                 (p/let [block (db-async/<get-block (state/get-current-repo) page-name {:children? false})]
+                   (if block
+                     (route-handler/redirect-to-page! block-uuid)
+                     (notification/show! (str "Open link failed. Page `" page-name "` doesn't exist in the graph."
+                                              :result block) :error false)))
 
                  block-uuid
-                 (if (db-model/get-block-by-uuid block-uuid)
-                   (route-handler/redirect-to-page! block-uuid)
-                   (notification/show! (str "Open link failed. Block-id `" block-uuid "` doesn't exist in the graph.") :error false))
+                 (p/let [block (db-async/<get-block (state/get-current-repo) block-uuid {:children? false})]
+                   (if block
+                     (route-handler/redirect-to-page! block-uuid)
+                     (notification/show! (str "Open link failed. Block-id `" block-uuid "` doesn't exist in the graph."
+                                              :result block) :error false)))
 
                  :else
                  nil)
@@ -73,7 +77,7 @@
                                    [(keyword key) (.get search-params key)])
                                  ["title" "url" "type" "payload"]))]
         (if (:payload result)
-          (let [raw (gp-util/safe-decode-uri-component (:payload result))
+          (let [raw (common-util/safe-decode-uri-component (:payload result))
                 payload (-> raw
                             js/JSON.parse
                             (js->clj :keywordize-keys true))]

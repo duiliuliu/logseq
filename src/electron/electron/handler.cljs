@@ -13,26 +13,26 @@
             ["path" :as node-path]
             [cljs-bean.core :as bean]
             [cljs.reader :as reader]
-            [clojure.core.async :as async]
             [clojure.string :as string]
             [electron.backup-file :as backup-file]
             [electron.configs :as cfgs]
+            [electron.db :as db]
             [electron.file-sync-rsapi :as rsapi]
             [electron.find-in-page :as find]
             [electron.fs-watcher :as watcher]
             [electron.git :as git]
+            [electron.handler-interface :refer [handle]]
             [electron.logger :as logger]
             [electron.plugin :as plugin]
-            [electron.search :as search]
-            [electron.db :as db]
             [electron.server :as server]
             [electron.shell :as shell]
             [electron.state :as state]
             [electron.utils :as utils]
             [electron.window :as win]
-            [electron.handler-interface :refer [handle]]
-            [logseq.db.sqlite.util :as sqlite-util]
+            [goog.functions :refer [debounce]]
             [logseq.common.graph :as common-graph]
+            [logseq.db.common.sqlite :as common-sqlite]
+            [logseq.db.sqlite.util :as sqlite-util]
             [promesa.core :as p]))
 
 (defmethod handle :mkdir [_window [_ dir]]
@@ -123,7 +123,7 @@
       (when (and (chmod-enabled?) (fs/existsSync path) (not (writable? path)))
         (fs/chmodSync path "644"))
       (fs/writeFileSync path content)
-      (fs/statSync path)
+      (utils/fs-stat->clj path)
       (catch :default e
         (logger/warn ::write-file path e)
         (let [backup-path (try
@@ -144,7 +144,7 @@
   (fs/renameSync old-path new-path))
 
 (defmethod handle :stat [_window [_ path]]
-  (fs/statSync path))
+  (utils/fs-stat->clj path))
 
 (defn- get-files
   "Returns vec of file-objs"
@@ -203,13 +203,6 @@
     (bean/->js {:path path
                 :files files})))
 
-(defn- sanitize-graph-name
-  [graph-name]
-  (when graph-name
-    (-> graph-name
-        (string/replace "/" "++")
-        (string/replace ":" "+3A+"))))
-
 (defn- graph-name->path
   [graph-name]
   (when graph-name
@@ -227,13 +220,10 @@
 
 (defn- get-db-based-graphs-dir
   []
-  (let [dir (if utils/ci?
-              (.resolve node-path js/__dirname "../tmp/graphs")
-              (.join node-path (.homedir os) "logseq" "graphs"))]
+  (let [dir (.join node-path (.homedir os) "logseq" "graphs")]
     (fs-extra/ensureDirSync dir)
     dir))
 
-;; TODO: move file based graphs to "~/logseq/graphs" too
 (defn- get-file-based-graphs
   "Returns all graph names in the cache directory (starting with `logseq_local_`)"
   []
@@ -244,19 +234,22 @@
          (map graph-name->path))))
 
 (defn- get-db-based-graphs
-  "Returns all graph names in the cache directory"
   []
   (let [dir (get-db-based-graphs-dir)]
     (->> (common-graph/read-directories dir)
          (remove (fn [s] (= s db/unlinked-graphs-dir)))
          (map graph-name->path)
-         (map (fn [s] (str sqlite-util/db-version-prefix s))))))
+         (map (fn [s]
+                (if (string/starts-with? s common-sqlite/file-version-prefix)
+                  s
+                  (str sqlite-util/db-version-prefix s)))))))
 
 (defn- get-graphs
+  "Returns all graph names"
   []
-  (concat
-   (get-file-based-graphs)
-   (get-db-based-graphs)))
+  (let [db-graphs (get-db-based-graphs)
+        file-graphs (get-file-based-graphs)]
+    (distinct (concat db-graphs file-graphs))))
 
 ;; TODO support alias mechanism
 (defn get-graph-name
@@ -298,73 +291,21 @@
 (defmethod handle :readGraphTxIdInfo [_win [_ root]]
   (read-txid-info! root))
 
-(defn- get-graph-path
-  [graph-name]
+(defmethod handle :deleteGraph [_window [_ graph graph-name _db-based?]]
   (when graph-name
-    (let [graph-name (sanitize-graph-name graph-name)
-          dir (get-graphs-dir)]
-      (.join node-path dir (str graph-name ".transit")))))
-
-(defn- get-serialized-graph
-  [graph-name]
-  (when graph-name
-    (when-let [file-path (get-graph-path graph-name)]
-      (when (fs/existsSync file-path)
-        (utils/read-file file-path)))))
-
-(defmethod handle :getSerializedGraph [_window [_ graph-name]]
-  (get-serialized-graph graph-name))
-
-(defmethod handle :saveGraph [_window [_ graph-name value-str]]
-  ;; NOTE: graph-name is a plain "local" for demo graph.
-  (when (and graph-name value-str (not (= "local" graph-name)))
-    (when-let [file-path (get-graph-path graph-name)]
-      (fs/writeFileSync file-path value-str))))
-
-(defmethod handle :deleteGraph [_window [_ graph graph-name db-based?]]
-  (when graph-name
-    (if (and db-based? graph)
-      (db/unlink-graph! graph)
-      (when-let [file-path (get-graph-path graph-name)]
-       (when (fs/existsSync file-path)
-         (fs-extra/removeSync file-path))))))
-
-(defmethod handle :persistent-dbs-saved [_window _]
-  (async/put! state/persistent-dbs-chan true)
-  true)
-
-;; Search related IPCs
-(defmethod handle :search-blocks [_window [_ repo q opts]]
-  (search/search-blocks repo q opts))
-
-(defmethod handle :rebuild-indice [_window [_ repo block-data]]
-  (search/truncate-blocks-table! repo)
-  ;; unneeded serialization
-  (search/upsert-blocks! repo (bean/->js block-data))
-  [])
-
-(defmethod handle :transact-blocks [_window [_ repo data]]
-  (let [{:keys [blocks-to-remove-set blocks-to-add]} data]
-    ;; Order matters! Same id will delete then upsert sometimes.
-    (when (seq blocks-to-remove-set)
-      (search/delete-blocks! repo blocks-to-remove-set))
-    (when (seq blocks-to-add)
-      ;; unneeded serialization
-      (search/upsert-blocks! repo (bean/->js blocks-to-add)))))
-
-(defmethod handle :truncate-indice [_window [_ repo]]
-  (search/truncate-blocks-table! repo))
-
-(defmethod handle :remove-db [_window [_ repo]]
-  (search/delete-db! repo))
-;; ^^^^
-;; Search related IPCs End
+    (db/unlink-graph! graph)
+    (let [old-transit-path (node-path/join (get-graphs-dir) (str (common-sqlite/sanitize-db-name graph) ".transit"))]
+      (when (fs/existsSync old-transit-path)
+        (fs/unlinkSync old-transit-path)))))
 
 ;; DB related IPCs start
 
 (defmethod handle :db-export [_window [_ repo data]]
   (db/ensure-graph-dir! repo)
   (db/save-db! repo data))
+
+(defmethod handle :db-get [_window [_ repo]]
+  (db/get-db repo))
 
 ;; DB related IPCs End
 
@@ -384,9 +325,7 @@
 
 (defmethod handle :clearCache [window _]
   (logger/info ::clear-cache)
-  (search/close!)
-  (clear-cache! window)
-  (search/ensure-search-dir!))
+  (clear-cache! window))
 
 (defmethod handle :openDialog [^js _window _messages]
   (open-dir-dialog))
@@ -482,7 +421,6 @@
   (let [old-path (state/get-window-graph-path window)]
     (when (and old-path graph-path (not= old-path graph-path))
       (close-watcher-when-orphaned! window old-path))
-    (swap! state/state assoc :graph/current graph-path)
     (swap! state/state assoc-in [:window/graph window] graph-path)
     nil))
 
@@ -490,14 +428,14 @@
   (when graph-name
     (set-current-graph! window (utils/get-graph-dir graph-name))))
 
-(defmethod handle :runGit [_ [_ args]]
-  (when (seq args)
-    (git/raw! args)))
+(defmethod handle :runGit [_ [_ {:keys [repo command]}]]
+  (when (seq command)
+    (git/raw! (utils/get-graph-dir repo) command)))
 
-(defmethod handle :runGitWithinCurrentGraph [_ [_ args]]
-  (when (seq args)
-    (git/init!)
-    (git/run-git2! (clj->js args))))
+(defmethod handle :runGitWithinCurrentGraph [_ [_ {:keys [repo command]}]]
+  (when (seq command)
+    (git/init! (utils/get-graph-dir repo))
+    (git/run-git2! (utils/get-graph-dir repo) (clj->js command))))
 
 (defmethod handle :runCli [window [_ {:keys [command args returnResult]}]]
   (try
@@ -520,11 +458,16 @@
 (defmethod handle :gitCommitAll [_ [_ message]]
   (git/add-all-and-commit! message))
 
-(defmethod handle :gitStatus [_ [_]]
-  (git/short-status!))
+(defmethod handle :gitStatus [_ [_ repo]]
+  (git/short-status! (utils/get-graph-dir repo)))
 
-(defmethod handle :installMarketPlugin [_ [_ mft]]
-  (plugin/install-or-update! mft))
+(def debounced-configure-auto-commit! (debounce git/configure-auto-commit! 5000))
+(defmethod handle :setGitAutoCommit []
+  (debounced-configure-auto-commit!)
+  nil)
+
+(defmethod handle :installMarketPlugin [_ [_ manifest]]
+  (plugin/install-or-update! manifest))
 
 (defmethod handle :updateMarketPlugin [_ [_ pkg]]
   (plugin/install-or-update! pkg))
@@ -622,11 +565,6 @@
     (f window graph-name)
     (state/set-state! :window/once-graph-ready nil)))
 
-(defmethod handle :reloadWindowPage [^js win]
-  (logger/warn ::reload-window-page)
-  (when-let [web-content (.-webContents win)]
-    (.reload web-content)))
-
 (defmethod handle :window-minimize [^js win]
   (.minimize win))
 
@@ -717,6 +655,9 @@
 
 (defmethod handle :system/info [^js _win _]
   {:home-dir (.homedir os)})
+
+(defmethod handle :window/open-blank-callback [^js win [_ _type]]
+  (win/setup-window-listeners! win) nil)
 
 (defn set-ipc-handler! [window]
   (let [main-channel "main"]

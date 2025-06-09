@@ -10,6 +10,8 @@
 
 (defonce *graph-instance (atom nil))
 (defonce *simulation (atom nil))
+(defonce *simulation-paused?
+  (atom false))
 
 (def Graph (gobj/get graphology "Graph"))
 
@@ -38,7 +40,7 @@
                         (let [v (js/Math.abs (hash parent))]
                           (nth colors (mod v (count colors)))))
                       (.-color node)))
-          :label  {:content  (fn [node] (.-id node))
+          :label  {:content  (fn [node] (.-label node))
                    :type     (.-TEXT (.-TextType Pixi-Graph))
                    :fontSize 12
                    :color (if dark? "rgba(255, 255, 255, 0.8)" "rgba(0, 0, 0, 0.8)")
@@ -54,20 +56,34 @@
    :edge {:color "#A5B4FC"}})
 
 (defn layout!
-  [nodes links]
-  (let [nodes-count (count nodes)
-        simulation (forceSimulation nodes)]
+  "Node forces documentation can be read in more detail here https://d3js.org/d3-force"
+  [nodes links link-dist charge-strength charge-range]
+  (let [simulation (forceSimulation nodes)]
     (-> simulation
         (.force "link"
+                ;; The link force pushes linked nodes together or apart according to the desired link distance.
+                ;; The strength of the force is proportional to the difference between the linked nodes distance
+                ;; and the target distance, similar to a spring force.
                 (-> (forceLink)
                     (.id (fn [d] (.-id d)))
-                    (.distance 180)
+                    (.distance link-dist)
                     (.links links)))
         (.force "charge"
+                ;; The many-body (or n-body) force applies mutually amongst all nodes.
+                ;; It can be used to simulate gravity or electrostatic charge.
                 (-> (forceManyBody)
-                    (.distanceMax (if (> nodes-count 500) 4000 600))
+                    ;; The minimum distance between nodes over which this force is considered.
+                    ;; A minimum distance establishes an upper bound on the strength of the force between two nearby nodes, avoiding instability.
+                    (.distanceMin 1)
+                    ;; The maximum distance between nodes over which this force is considered.
+                    ;; Specifying a finite maximum distance improves performance and produces a more localized layout.
+                    (.distanceMax charge-range)
+                    ;; For a cluster of nodes that is far away, the charge force can be approximated by treating the cluster as a single, larger node.
+                    ;; The theta parameter determines the accuracy of the approximation
                     (.theta 0.5)
-                    (.strength -600)))
+                    ;; A positive value causes nodes to attract each other, similar to gravity,
+                    ;; while a negative value causes nodes to repel each other, similar to electrostatic charge.
+                    (.strength charge-strength)))
         (.force "collision"
                 (-> (forceCollide)
                     (.radius (+ 8 18))
@@ -75,7 +91,10 @@
         (.force "x" (-> (forceX 0) (.strength 0.02)))
         (.force "y" (-> (forceY 0) (.strength 0.02)))
         (.force "center" (forceCenter))
-        (.velocityDecay 0.8))
+        ;; The decay factor is akin to atmospheric friction; after the application of any forces during a tick,
+        ;; each node’s velocity is multiplied by 1 - decay. As with lowering the alpha decay rate,
+        ;; less velocity decay may converge on a better solution, but risks numerical instabilities and oscillation.
+        (.velocityDecay 0.5))
     (reset! *simulation simulation)
     simulation))
 
@@ -96,7 +115,20 @@
   (when-let [instance (:pixi @*graph-instance)]
     (.destroy instance)
     (reset! *graph-instance nil)
-    (reset! *simulation nil)))
+    (reset! *simulation nil))
+  (reset! *simulation-paused? false))
+
+(defn stop-simulation!
+  []
+  (when-let [^js simulation @*simulation]
+    (.stop simulation)
+    (reset! *simulation-paused? true)))
+
+(defn resume-simulation!
+  []
+  (when-let [^js simulation @*simulation]
+    (.restart simulation))
+  (reset! *simulation-paused? false))
 
 (defn- update-position!
   [node obj]
@@ -144,7 +176,8 @@
              #_:clj-kondo/ignore
              (when-let [node (.get nodes node-key)]
                (when-let [s @*simulation]
-                 (when-not (.-active event)
+                 (when-not (or (.-active event)
+                               @*simulation-paused?)
                    (-> (.alphaTarget s 0.3)
                        (.restart))
                    (js/setTimeout #(.alphaTarget s 0) 2000))
@@ -167,40 +200,40 @@
     (when @*graph-instance
       (clear-nodes! (:graph @*graph-instance))
       (destroy-instance!))
-    (let [{:keys [nodes links style hover-style height register-handlers-fn dark?]} (first (:rum/args state))
-          style                                                                     (or style (default-style dark?))
-          hover-style                                                               (or hover-style (default-hover-style dark?))
-          graph                                                                     (Graph.)
-          nodes-set                                                                 (set (map :id nodes))
-          links                                                                     (->>
-                                                                                     (filter
-                                                                                      (fn [link]
-                                                                                        (and (nodes-set (:source link)) (nodes-set (:target link))))
-                                                                                      links)
-                                                                                     (distinct)) ;; #3331 (@zhaohui0923) seems caused by duplicated links. Why distinct doesn't work?
-          nodes                                                                     (remove nil? nodes)
-          links                                                                     (remove (fn [{:keys [source target]}] (or (nil? source) (nil? target))) links)
-          nodes-js                                                                  (bean/->js nodes)
-          links-js                                                                  (bean/->js links)
-          simulation                                                                (layout! nodes-js links-js)]
+    (let [{:keys [nodes links style hover-style height register-handlers-fn dark? link-dist charge-strength charge-range]} (first (:rum/args state))
+          style       (or style (default-style dark?))
+          hover-style (or hover-style (default-hover-style dark?))
+          graph       (Graph.)
+          nodes-set   (set (map :id nodes))
+          links       (->>
+                       (filter
+                        (fn [link]
+                          (and (nodes-set (:source link)) (nodes-set (:target link))))
+                        links)
+                       (distinct)) ;; #3331 (@zhaohui0923) seems caused by duplicated links. Why distinct doesn't work?
+          nodes       (remove nil? nodes)
+          links       (remove (fn [{:keys [source target]}] (or (nil? source) (nil? target))) links)
+          nodes-js    (bean/->js nodes)
+          links-js    (bean/->js links)
+          simulation  (layout! nodes-js links-js link-dist charge-strength charge-range)]
       (doseq [node nodes-js]
         (try (.addNode graph (.-id node) node)
-          (catch :default e
-            (js/console.error e))))
+             (catch :default e
+               (js/console.error e))))
       (doseq [link links-js]
         (let [source (.-id (.-source link))
               target (.-id (.-target link))]
           (try (.addEdge graph source target link)
-            (catch :default e
-              (js/console.error e)))))
+               (catch :default e
+                 (js/console.error e)))))
       (when-let [container-ref (:ref state)]
         (let [pixi-graph (new (.-PixiGraph Pixi-Graph)
-                           (bean/->js
-                            {:container  @container-ref
-                             :graph      graph
-                             :style      style
-                             :hoverStyle hover-style
-                             :height     height}))]
+                              (bean/->js
+                               {:container  @container-ref
+                                :graph      graph
+                                :style      style
+                                :hoverStyle hover-style
+                                :height     height}))]
           (reset! *graph-instance
                   {:graph graph
                    :pixi  pixi-graph})
